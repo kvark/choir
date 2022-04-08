@@ -2,9 +2,15 @@
 name = "choir"
 version = "0.1.0"
 edition = "2021"
+description = "Task Orchestration Framework"
+license = "MIT"
+documentation = "https://docs.rs/choir"
+repository = "https://github.com/kvark/choir"
+keywords = ["job-system", "tasks"]
+categories = ["concurrency", "game-development"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-crossbeam = "0.8"
+crossbeam-deque = "0.8"
 log = "0.4"

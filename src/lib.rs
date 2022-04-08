@@ -1,10 +1,28 @@
-use crossbeam::deque::{Injector, Steal};
+#![allow(
+    renamed_and_removed_lints,
+    clippy::new_without_default,
+    clippy::unneeded_field_pattern,
+    clippy::match_like_matches_macro,
+    clippy::manual_strip,
+    clippy::if_same_then_else,
+    clippy::unknown_clippy_lints
+)]
+#![warn(
+    trivial_casts,
+    trivial_numeric_casts,
+    unused_extern_crates,
+    unused_qualifications,
+    clippy::pattern_type_mismatch
+)]
+
+use crossbeam_deque::{Injector, Steal};
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
     thread,
+    time::Duration,
 };
 
 struct Task {
@@ -49,6 +67,8 @@ pub struct SingerHandle {
     singer: Arc<Singer>,
 }
 
+pub struct Song {}
+
 impl Choir {
     pub fn new() -> Self {
         let injector = Injector::new();
@@ -79,13 +99,20 @@ impl Choir {
         SingerHandle { singer }
     }
 
-    pub fn sing(&self, song: impl FnOnce() + Send + 'static) {
+    pub fn sing(&self, song: impl FnOnce() + Send + 'static) -> Song {
         self.shared.injector.push(Task {
             song: Box::new(song),
         });
         //TODO: unpark one instead of all
         for dossier in self.singers.iter() {
             dossier.join_handle.thread().unpark();
+        }
+        Song {}
+    }
+
+    pub fn wait_idle(&self) {
+        while !self.shared.injector.is_empty() {
+            thread::sleep(Duration::from_millis(100));
         }
     }
 }
