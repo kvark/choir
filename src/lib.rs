@@ -16,21 +16,35 @@
 )]
 
 use crossbeam_deque::{Injector, Steal};
+use sharded_slab::Slab;
 use std::{
+    mem,
     sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Mutex,
     },
     thread,
     time::Duration,
 };
 
-struct Task {
-    song: Box<dyn FnOnce() + Send + 'static>,
+const MAX_SINGERS: u32 = mem::size_of::<usize>() as u32 * 8;
+
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct Blocker {
+    #[allow(dead_code)]
+    id: usize,
 }
 
-struct Shared {
-    injector: Injector<Task>,
+#[doc(hidden)]
+pub enum Continuation {
+    Playing { dependents: Vec<Arc<Blocker>> },
+    Done,
+}
+
+struct Task {
+    song: Box<dyn FnOnce() + Send + 'static>,
+    continuation: Arc<Mutex<Continuation>>,
 }
 
 struct Singer {
@@ -38,43 +52,115 @@ struct Singer {
     alive: AtomicBool,
 }
 
-impl Singer {
-    fn work_loop(&self, shared: Arc<Shared>) {
-        while self.alive.load(Ordering::Acquire) {
-            match shared.injector.steal() {
-                Steal::Empty => thread::park(),
+struct Dossier {
+    _singer: Arc<Singer>,
+    thread: thread::Thread,
+}
+
+struct Shared {
+    injector: Injector<Task>,
+    dossiers: Slab<Dossier>,
+    parked_mask: AtomicUsize,
+}
+
+impl Shared {
+    fn execute(&self, task: Task) {
+        self.injector.push(task);
+        // Wake up the first sleeping thread.
+        let mask = self.parked_mask.load(Ordering::Relaxed);
+        let index = mask.trailing_zeros();
+        if index != MAX_SINGERS {
+            let dossier = self.dossiers.get(index as usize).unwrap();
+            dossier.thread.unpark();
+        }
+    }
+
+    fn work_loop(&self, singer: Arc<Singer>) {
+        let index = self
+            .dossiers
+            .insert(Dossier {
+                _singer: Arc::clone(&singer),
+                thread: thread::current(),
+            })
+            .unwrap();
+        while singer.alive.load(Ordering::Acquire) {
+            match self.injector.steal() {
+                Steal::Empty => {
+                    let mask = 1 << index;
+                    self.parked_mask.fetch_or(mask, Ordering::Relaxed);
+                    thread::park();
+                    self.parked_mask.fetch_and(!mask, Ordering::Relaxed);
+                }
                 Steal::Success(task) => {
                     (task.song)();
+                    let dependents = match mem::replace(
+                        &mut *task.continuation.lock().unwrap(),
+                        Continuation::Done,
+                    ) {
+                        Continuation::Playing { dependents } => dependents,
+                        Continuation::Done => unreachable!(),
+                    };
+                    for blocker in dependents {
+                        if let Ok(_ready) = Arc::try_unwrap(blocker) {
+                            //TODO: unblock the dependent task?
+                        }
+                    }
                 }
                 Steal::Retry => {}
             }
         }
-        log::info!("Terminating singer {}", self.name);
+        log::info!("Terminating singer {}", singer.name);
     }
-}
-
-struct Dossier {
-    singer: Arc<Singer>,
-    join_handle: thread::JoinHandle<()>,
 }
 
 pub struct Choir {
     shared: Arc<Shared>,
-    singers: Vec<Dossier>,
+    next_id: AtomicUsize,
 }
 
 pub struct SingerHandle {
     singer: Arc<Singer>,
+    join_handle: Option<thread::JoinHandle<()>>,
 }
 
-pub struct Song {}
+pub struct Song {
+    shared: Arc<Shared>,
+    task: Task,
+    blocker: Arc<Blocker>,
+}
+
+impl AsRef<Mutex<Continuation>> for Song {
+    fn as_ref(&self) -> &Mutex<Continuation> {
+        &self.task.continuation
+    }
+}
+
+pub enum PlayingSong {
+    Waiting(Song),
+    Active {
+        continuation: Arc<Mutex<Continuation>>,
+    },
+}
+
+impl AsRef<Mutex<Continuation>> for PlayingSong {
+    fn as_ref(&self) -> &Mutex<Continuation> {
+        match *self {
+            Self::Waiting(ref song) => &song.task.continuation,
+            Self::Active { ref continuation } => continuation,
+        }
+    }
+}
 
 impl Choir {
     pub fn new() -> Self {
         let injector = Injector::new();
         Self {
-            shared: Arc::new(Shared { injector }),
-            singers: Vec::new(),
+            shared: Arc::new(Shared {
+                injector,
+                dossiers: Slab::new(),
+                parked_mask: AtomicUsize::new(0),
+            }),
+            next_id: AtomicUsize::new(1),
         }
     }
 
@@ -88,26 +174,32 @@ impl Choir {
 
         let join_handle = thread::Builder::new()
             .name(name.to_string())
-            .spawn(move || singer_clone.work_loop(shared))
+            .spawn(move || shared.work_loop(singer_clone))
             .unwrap();
 
-        self.singers.push(Dossier {
-            singer: Arc::clone(&singer),
-            join_handle,
-        });
-
-        SingerHandle { singer }
+        SingerHandle {
+            singer,
+            join_handle: Some(join_handle),
+        }
     }
 
-    pub fn sing(&self, song: impl FnOnce() + Send + 'static) -> Song {
-        self.shared.injector.push(Task {
-            song: Box::new(song),
-        });
-        //TODO: unpark one instead of all
-        for dossier in self.singers.iter() {
-            dossier.join_handle.thread().unpark();
+    pub fn sing_later(&self, song: impl FnOnce() + Send + 'static) -> Song {
+        Song {
+            shared: Arc::clone(&self.shared),
+            task: Task {
+                song: Box::new(song),
+                continuation: Arc::new(Mutex::new(Continuation::Playing {
+                    dependents: Vec::new(),
+                })),
+            },
+            blocker: Arc::new(Blocker {
+                id: self.next_id.fetch_add(1, Ordering::AcqRel),
+            }),
         }
-        Song {}
+    }
+
+    pub fn sing_now(&self, song: impl FnOnce() + Send + 'static) -> PlayingSong {
+        self.sing_later(song).sing()
     }
 
     pub fn wait_idle(&self) {
@@ -120,13 +212,27 @@ impl Choir {
 impl Drop for SingerHandle {
     fn drop(&mut self) {
         self.singer.alive.store(false, Ordering::Release);
+        let _ = self.join_handle.take().unwrap().join();
     }
 }
 
-impl Drop for Choir {
-    fn drop(&mut self) {
-        for dossier in self.singers.iter() {
-            dossier.singer.alive.store(false, Ordering::Release);
+impl Song {
+    pub fn sing(self) -> PlayingSong {
+        if Arc::strong_count(&self.blocker) == 1 {
+            let continuation = Arc::clone(&self.task.continuation);
+            self.shared.execute(self.task);
+            PlayingSong::Active { continuation }
+        } else {
+            PlayingSong::Waiting(self)
+        }
+    }
+
+    pub fn depend_on<C: AsRef<Mutex<Continuation>>>(&self, other: C) {
+        match *other.as_ref().lock().unwrap() {
+            Continuation::Playing { ref mut dependents } => {
+                dependents.push(Arc::clone(&self.blocker));
+            }
+            Continuation::Done => {}
         }
     }
 }
