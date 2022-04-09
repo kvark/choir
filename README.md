@@ -2,16 +2,18 @@
 
 [![Crates.io](https://img.shields.io/crates/v/choir.svg?label=choir)](https://crates.io/crates/choir)
 [![Docs.rs](https://docs.rs/choir/badge.svg)](https://docs.rs/choir)
-[![Build Status](https://github.com/kvark/choir/workflows/pipeline/badge.svg)](https://github.com/kvark/choir/actions)
+[![Build Status](https://github.com/kvark/choir/workflows/Check/badge.svg)](https://github.com/kvark/choir/actions)
 ![MSRV](https://img.shields.io/badge/rustc-1.56+-blue.svg)
-[![codecov.io](https://codecov.io/gh/kvark/choir/branch/master/graph/badge.svg?token=9VOKYO8BM2)](https://codecov.io/gh/kvark/choir)
+[![codecov.io](https://codecov.io/gh/kvark/choir/branch/main/graph/badge.svg)](https://codecov.io/gh/kvark/choir)
 
 Choir is a task orchestration framework. It helps you to organize all the CPU workflow in terms of tasks.
 
-_Principles_ are simple: no unsafe code, and minimize the locking.
+_Principles_ are simple: no unsafe code, and minimize any locking in order to scale well.
 
 ### Example:
 ```rust
+let choir = choir::Choir::new();
+let _worker = choir.add_worker("worker");
 let task1 = choir.run_task(|| { println!("foo"); });
 let task2 = choir.idle_task(|| { println!("bar"); });
 task2.depend_on(&task1);
