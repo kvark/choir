@@ -6,3 +6,7 @@
 ![MSRV](https://img.shields.io/badge/rustc-1.56+-blue.svg)
 
 Choir is a task orchestration framework. It helps you to organize all the CPU workflow in terms of tasks.
+
+Principles:
+  - no unsafe code
+  - minimal locking

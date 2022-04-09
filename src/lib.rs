@@ -16,12 +16,11 @@
 )]
 
 use crossbeam_deque::{Injector, Steal};
-use sharded_slab::Slab;
 use std::{
     mem,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, RwLock, Weak,
     },
     thread,
     time::Duration,
@@ -30,20 +29,18 @@ use std::{
 const MAX_SINGERS: u32 = mem::size_of::<usize>() as u32 * 8;
 
 #[doc(hidden)]
-#[derive(Debug)]
-pub struct Blocker {
-    #[allow(dead_code)]
-    id: usize,
-}
-
-#[doc(hidden)]
 pub enum Continuation {
-    Playing { dependents: Vec<Arc<Blocker>> },
+    Playing {
+        dependents: Vec<Arc<Task>>,
+        baton: Weak<()>,
+    },
     Done,
 }
 
-struct Task {
-    song: Box<dyn FnOnce() + Send + 'static>,
+#[doc(hidden)]
+pub struct Task {
+    id: usize,
+    song: Box<dyn FnOnce() + Send + Sync + 'static>,
     continuation: Arc<Mutex<Continuation>>,
 }
 
@@ -52,69 +49,85 @@ struct Singer {
     alive: AtomicBool,
 }
 
-struct Dossier {
-    _singer: Arc<Singer>,
+struct SingerContext {
+    _inner: Arc<Singer>,
     thread: thread::Thread,
 }
 
-struct Shared {
+struct Conductor {
     injector: Injector<Task>,
-    dossiers: Slab<Dossier>,
+    //TODO: use a concurrent growable vector here
+    singers: RwLock<Vec<SingerContext>>,
     parked_mask: AtomicUsize,
+    // A counter of all the tasks that are alive.
+    baton: Arc<()>,
 }
 
-impl Shared {
-    fn execute(&self, task: Task) {
+impl Conductor {
+    fn schedule(&self, task: Task) {
+        log::trace!("Task {} is scheduled", task.id);
         self.injector.push(task);
         // Wake up the first sleeping thread.
         let mask = self.parked_mask.load(Ordering::Relaxed);
         let index = mask.trailing_zeros();
         if index != MAX_SINGERS {
-            let dossier = self.dossiers.get(index as usize).unwrap();
-            dossier.thread.unpark();
+            let singers = self.singers.read().unwrap();
+            singers[index as usize].thread.unpark();
         }
     }
 
     fn work_loop(&self, singer: Arc<Singer>) {
-        let index = self
-            .dossiers
-            .insert(Dossier {
-                _singer: Arc::clone(&singer),
+        let index = {
+            let mut singers = self.singers.write().unwrap();
+            let index = singers.len();
+            singers.push(SingerContext {
+                _inner: Arc::clone(&singer),
                 thread: thread::current(),
-            })
-            .unwrap();
+            });
+            index
+        };
+        log::info!("Thread[{}] = '{}' started", index, singer.name);
+
         while singer.alive.load(Ordering::Acquire) {
             match self.injector.steal() {
                 Steal::Empty => {
+                    log::trace!("Thread '{}' sleeps", singer.name);
                     let mask = 1 << index;
                     self.parked_mask.fetch_or(mask, Ordering::Relaxed);
                     thread::park();
                     self.parked_mask.fetch_and(!mask, Ordering::Relaxed);
                 }
                 Steal::Success(task) => {
+                    log::trace!("Thread '{}' runs task {}", singer.name, task.id);
                     (task.song)();
                     let dependents = match mem::replace(
                         &mut *task.continuation.lock().unwrap(),
                         Continuation::Done,
                     ) {
-                        Continuation::Playing { dependents } => dependents,
+                        //Note: it's fine at this point to drop `baton`:
+                        // if it's the last task, we don't have any dependencies anyway.
+                        // Otherwise, the dependencies will have batons of their own.
+                        Continuation::Playing {
+                            dependents,
+                            baton: _,
+                        } => dependents,
                         Continuation::Done => unreachable!(),
                     };
-                    for blocker in dependents {
-                        if let Ok(_ready) = Arc::try_unwrap(blocker) {
-                            //TODO: unblock the dependent task?
+                    for task in dependents {
+                        if let Ok(ready) = Arc::try_unwrap(task) {
+                            self.schedule(ready);
                         }
                     }
                 }
                 Steal::Retry => {}
             }
         }
-        log::info!("Terminating singer {}", singer.name);
+        log::info!("Thread '{}' dies", singer.name);
     }
 }
 
 pub struct Choir {
-    shared: Arc<Shared>,
+    conductor: Arc<Conductor>,
     next_id: AtomicUsize,
 }
 
@@ -124,9 +137,8 @@ pub struct SingerHandle {
 }
 
 pub struct Song {
-    shared: Arc<Shared>,
-    task: Task,
-    blocker: Arc<Blocker>,
+    conductor: Arc<Conductor>,
+    task: Arc<Task>,
 }
 
 impl AsRef<Mutex<Continuation>> for Song {
@@ -135,19 +147,13 @@ impl AsRef<Mutex<Continuation>> for Song {
     }
 }
 
-pub enum PlayingSong {
-    Waiting(Song),
-    Active {
-        continuation: Arc<Mutex<Continuation>>,
-    },
+pub struct PlayingSong {
+    continuation: Arc<Mutex<Continuation>>,
 }
 
 impl AsRef<Mutex<Continuation>> for PlayingSong {
     fn as_ref(&self) -> &Mutex<Continuation> {
-        match *self {
-            Self::Waiting(ref song) => &song.task.continuation,
-            Self::Active { ref continuation } => continuation,
-        }
+        &self.continuation
     }
 }
 
@@ -155,10 +161,11 @@ impl Choir {
     pub fn new() -> Self {
         let injector = Injector::new();
         Self {
-            shared: Arc::new(Shared {
+            conductor: Arc::new(Conductor {
                 injector,
-                dossiers: Slab::new(),
+                singers: RwLock::new(Vec::new()),
                 parked_mask: AtomicUsize::new(0),
+                baton: Arc::new(()),
             }),
             next_id: AtomicUsize::new(1),
         }
@@ -169,12 +176,12 @@ impl Choir {
             name: name.to_string(),
             alive: AtomicBool::new(true),
         });
-        let shared = Arc::clone(&self.shared);
+        let conductor = Arc::clone(&self.conductor);
         let singer_clone = Arc::clone(&singer);
 
         let join_handle = thread::Builder::new()
             .name(name.to_string())
-            .spawn(move || shared.work_loop(singer_clone))
+            .spawn(move || conductor.work_loop(singer_clone))
             .unwrap();
 
         SingerHandle {
@@ -183,27 +190,38 @@ impl Choir {
         }
     }
 
-    pub fn sing_later(&self, song: impl FnOnce() + Send + 'static) -> Song {
-        Song {
-            shared: Arc::clone(&self.shared),
-            task: Task {
-                song: Box::new(song),
-                continuation: Arc::new(Mutex::new(Continuation::Playing {
-                    dependents: Vec::new(),
-                })),
-            },
-            blocker: Arc::new(Blocker {
-                id: self.next_id.fetch_add(1, Ordering::AcqRel),
-            }),
+    fn create_task(&self, song: impl FnOnce() + Send + Sync + 'static) -> Task {
+        Task {
+            id: self.next_id.fetch_add(1, Ordering::AcqRel),
+            song: Box::new(song),
+            continuation: Arc::new(Mutex::new(Continuation::Playing {
+                dependents: Vec::new(),
+                baton: Arc::downgrade(&self.conductor.baton),
+            })),
         }
     }
 
-    pub fn sing_now(&self, song: impl FnOnce() + Send + 'static) -> PlayingSong {
-        self.sing_later(song).sing()
+    pub fn sing_later(&self, song: impl FnOnce() + Send + Sync + 'static) -> Song {
+        Song {
+            conductor: Arc::clone(&self.conductor),
+            task: Arc::new(self.create_task(song)),
+        }
     }
 
-    pub fn wait_idle(&self) {
-        while !self.shared.injector.is_empty() {
+    pub fn sing_now(&self, song: impl FnOnce() + Send + Sync + 'static) -> PlayingSong {
+        const FALLBACK: bool = false;
+        if FALLBACK {
+            self.sing_later(song).sing()
+        } else {
+            let task = self.create_task(song);
+            let continuation = Arc::clone(&task.continuation);
+            self.conductor.schedule(task);
+            PlayingSong { continuation }
+        }
+    }
+
+    pub fn wait_idle(&mut self) {
+        while !self.conductor.injector.is_empty() || Arc::weak_count(&self.conductor.baton) != 0 {
             thread::sleep(Duration::from_millis(100));
         }
     }
@@ -212,25 +230,28 @@ impl Choir {
 impl Drop for SingerHandle {
     fn drop(&mut self) {
         self.singer.alive.store(false, Ordering::Release);
-        let _ = self.join_handle.take().unwrap().join();
+        let handle = self.join_handle.take().unwrap();
+        handle.thread().unpark();
+        let _ = handle.join();
     }
 }
 
 impl Song {
     pub fn sing(self) -> PlayingSong {
-        if Arc::strong_count(&self.blocker) == 1 {
-            let continuation = Arc::clone(&self.task.continuation);
-            self.shared.execute(self.task);
-            PlayingSong::Active { continuation }
-        } else {
-            PlayingSong::Waiting(self)
+        let continuation = Arc::clone(&self.task.continuation);
+        if let Ok(ready) = Arc::try_unwrap(self.task) {
+            self.conductor.schedule(ready);
         }
+        PlayingSong { continuation }
     }
 
     pub fn depend_on<C: AsRef<Mutex<Continuation>>>(&self, other: C) {
         match *other.as_ref().lock().unwrap() {
-            Continuation::Playing { ref mut dependents } => {
-                dependents.push(Arc::clone(&self.blocker));
+            Continuation::Playing {
+                ref mut dependents,
+                baton: _,
+            } => {
+                dependents.push(Arc::clone(&self.task));
             }
             Continuation::Done => {}
         }
