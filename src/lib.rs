@@ -26,7 +26,7 @@ use std::{
     time::Duration,
 };
 
-const MAX_SINGERS: u32 = mem::size_of::<usize>() as u32 * 8;
+const MAX_WORKERS: usize = mem::size_of::<usize>() * 8;
 
 #[doc(hidden)]
 pub enum Continuation {
@@ -40,24 +40,24 @@ pub enum Continuation {
 #[doc(hidden)]
 pub struct Task {
     id: usize,
-    song: Box<dyn FnOnce() + Send + Sync + 'static>,
+    fun: Box<dyn FnOnce() + Send + Sync + 'static>,
     continuation: Arc<Mutex<Continuation>>,
 }
 
-struct Singer {
+struct Worker {
     name: String,
     alive: AtomicBool,
 }
 
-struct SingerContext {
-    _inner: Arc<Singer>,
+struct WorkerContext {
+    _inner: Arc<Worker>,
     thread: thread::Thread,
 }
 
 struct Conductor {
     injector: Injector<Task>,
     //TODO: use a concurrent growable vector here
-    singers: RwLock<Vec<SingerContext>>,
+    workers: RwLock<Vec<WorkerContext>>,
     parked_mask: AtomicUsize,
     // A counter of all the tasks that are alive.
     baton: Arc<()>,
@@ -71,41 +71,42 @@ impl Conductor {
         while !self.injector.is_empty() {
             // Take the first sleeping thread.
             let mask = self.parked_mask.load(Ordering::Relaxed);
-            let index = mask.trailing_zeros();
-            if index == MAX_SINGERS {
+            let index = mask.trailing_zeros() as usize;
+            if index == MAX_WORKERS {
                 // everybody is busy, give up
                 break;
             }
-            let singers = self.singers.read().unwrap();
-            singers[index as usize].thread.unpark();
+            let workers = self.workers.read().unwrap();
+            workers[index].thread.unpark();
         }
     }
 
-    fn work_loop(&self, singer: Arc<Singer>) {
+    fn work_loop(&self, worker: Arc<Worker>) {
         let index = {
-            let mut singers = self.singers.write().unwrap();
-            let index = singers.len();
-            singers.push(SingerContext {
-                _inner: Arc::clone(&singer),
+            let mut workers = self.workers.write().unwrap();
+            let index = workers.len();
+            assert!(index < MAX_WORKERS);
+            workers.push(WorkerContext {
+                _inner: Arc::clone(&worker),
                 thread: thread::current(),
             });
             index
         };
-        log::info!("Thread[{}] = '{}' started", index, singer.name);
+        log::info!("Thread[{}] = '{}' started", index, worker.name);
 
-        while singer.alive.load(Ordering::Acquire) {
+        while worker.alive.load(Ordering::Acquire) {
             match self.injector.steal() {
                 Steal::Empty => {
-                    log::trace!("Thread '{}' sleeps", singer.name);
+                    log::trace!("Thread '{}' sleeps", worker.name);
                     let mask = 1 << index;
                     self.parked_mask.fetch_or(mask, Ordering::Relaxed);
                     thread::park();
                     self.parked_mask.fetch_and(!mask, Ordering::Relaxed);
                 }
                 Steal::Success(task) => {
-                    log::trace!("Thread '{}' runs task {}", singer.name, task.id);
+                    log::debug!("Task {} runs on thread '{}'", task.id, worker.name);
                     // execute the task
-                    (task.song)();
+                    (task.fun)();
                     // mark the task as done
                     let dependents = match mem::replace(
                         &mut *task.continuation.lock().unwrap(),
@@ -130,36 +131,37 @@ impl Conductor {
                 Steal::Retry => {}
             }
         }
-        log::info!("Thread '{}' dies", singer.name);
+        log::info!("Thread '{}' dies", worker.name);
     }
 }
 
+/// Main structure for managing tasks.
 pub struct Choir {
     conductor: Arc<Conductor>,
     next_id: AtomicUsize,
 }
 
-pub struct SingerHandle {
-    singer: Arc<Singer>,
+pub struct WorkerHandle {
+    worker: Arc<Worker>,
     join_handle: Option<thread::JoinHandle<()>>,
 }
 
-pub struct Song {
+pub struct IdleTask {
     conductor: Arc<Conductor>,
     task: Arc<Task>,
 }
 
-impl AsRef<Mutex<Continuation>> for Song {
+impl AsRef<Mutex<Continuation>> for IdleTask {
     fn as_ref(&self) -> &Mutex<Continuation> {
         &self.task.continuation
     }
 }
 
-pub struct PlayingSong {
+pub struct RunningTask {
     continuation: Arc<Mutex<Continuation>>,
 }
 
-impl AsRef<Mutex<Continuation>> for PlayingSong {
+impl AsRef<Mutex<Continuation>> for RunningTask {
     fn as_ref(&self) -> &Mutex<Continuation> {
         &self.continuation
     }
@@ -171,7 +173,7 @@ impl Choir {
         Self {
             conductor: Arc::new(Conductor {
                 injector,
-                singers: RwLock::new(Vec::new()),
+                workers: RwLock::new(Vec::new()),
                 parked_mask: AtomicUsize::new(0),
                 baton: Arc::new(()),
             }),
@@ -179,29 +181,30 @@ impl Choir {
         }
     }
 
-    pub fn add_singer(&mut self, name: &str) -> SingerHandle {
-        let singer = Arc::new(Singer {
+    pub fn add_worker(&mut self, name: &str) -> WorkerHandle {
+        let worker = Arc::new(Worker {
             name: name.to_string(),
             alive: AtomicBool::new(true),
         });
         let conductor = Arc::clone(&self.conductor);
-        let singer_clone = Arc::clone(&singer);
+        let worker_clone = Arc::clone(&worker);
 
         let join_handle = thread::Builder::new()
             .name(name.to_string())
-            .spawn(move || conductor.work_loop(singer_clone))
+            .spawn(move || conductor.work_loop(worker_clone))
             .unwrap();
 
-        SingerHandle {
-            singer,
+        WorkerHandle {
+            worker,
             join_handle: Some(join_handle),
         }
     }
 
-    fn create_task(&self, song: impl FnOnce() + Send + Sync + 'static) -> Task {
+    //Note: `Sync` doesn't seem necessary here, but Rust complains otherwise.
+    fn create_task(&self, fun: impl FnOnce() + Send + Sync + 'static) -> Task {
         Task {
             id: self.next_id.fetch_add(1, Ordering::AcqRel),
-            song: Box::new(song),
+            fun: Box::new(fun),
             continuation: Arc::new(Mutex::new(Continuation::Playing {
                 dependents: Vec::new(),
                 baton: Arc::downgrade(&self.conductor.baton),
@@ -209,22 +212,23 @@ impl Choir {
         }
     }
 
-    pub fn sing_later(&self, song: impl FnOnce() + Send + Sync + 'static) -> Song {
-        Song {
+    pub fn idle_task(&self, fun: impl FnOnce() + Send + Sync + 'static) -> IdleTask {
+        IdleTask {
             conductor: Arc::clone(&self.conductor),
-            task: Arc::new(self.create_task(song)),
+            task: Arc::new(self.create_task(fun)),
         }
     }
 
-    pub fn sing_now(&self, song: impl FnOnce() + Send + Sync + 'static) -> PlayingSong {
+    pub fn run_task(&self, fun: impl FnOnce() + Send + Sync + 'static) -> RunningTask {
         const FALLBACK: bool = false;
         if FALLBACK {
-            self.sing_later(song).sing()
+            self.idle_task(fun).run()
         } else {
-            let task = self.create_task(song);
+            // fast path skips the making of `Arc<Task>`
+            let task = self.create_task(fun);
             let continuation = Arc::clone(&task.continuation);
             self.conductor.schedule(task);
-            PlayingSong { continuation }
+            RunningTask { continuation }
         }
     }
 
@@ -235,22 +239,22 @@ impl Choir {
     }
 }
 
-impl Drop for SingerHandle {
+impl Drop for WorkerHandle {
     fn drop(&mut self) {
-        self.singer.alive.store(false, Ordering::Release);
+        self.worker.alive.store(false, Ordering::Release);
         let handle = self.join_handle.take().unwrap();
         handle.thread().unpark();
         let _ = handle.join();
     }
 }
 
-impl Song {
-    pub fn sing(self) -> PlayingSong {
+impl IdleTask {
+    pub fn run(self) -> RunningTask {
         let continuation = Arc::clone(&self.task.continuation);
         if let Ok(ready) = Arc::try_unwrap(self.task) {
             self.conductor.schedule(ready);
         }
-        PlayingSong { continuation }
+        RunningTask { continuation }
     }
 
     pub fn depend_on<C: AsRef<Mutex<Continuation>>>(&self, other: C) {
@@ -265,3 +269,7 @@ impl Song {
         }
     }
 }
+
+// Note: would be nice to log the dropping of `IdleTask`,
+// but currently unable to implement `drop` because it's getting
+// destructured in `IdleTask::run()`.
