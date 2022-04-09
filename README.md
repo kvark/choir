@@ -7,6 +7,15 @@
 
 Choir is a task orchestration framework. It helps you to organize all the CPU workflow in terms of tasks.
 
-Principles:
-  - no unsafe code
-  - minimal locking
+_Principles_ are simple: no unsafe code, and minimize the locking.
+
+General _use-case_ is: you create one task, then another, then establish some dependencies between them, then go. The task system is always alive, always chewing through work, or sleeping waiting for it.
+
+What makes Choir _elegant_? Generally when we need to encode the semantics of "wait for dependencies", we think of some sort of a counter. Maybe an atomic, for the dependency number. When it reaches zero (or one), we schedule a task for execution. In _Choir_, the internal data for a task (i.e. the functor itself!) is placed in an `Arc`. Whenever we are able to extract it from the `Arc` (which means there are no other dependencies), we move it to a scheduling queue. I think Rust type system shows its best here.
+
+**TODO**:
+  - code coverage
+  - benchmarking
+  - loop detection
+  - heavy use case
+  - reconsider goofy names?

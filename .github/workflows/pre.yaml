@@ -1,5 +1,5 @@
 # Regular testing.
-name: pipeline
+name: Check
 on: [push, pull_request]
 
 jobs:
