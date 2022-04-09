@@ -1,3 +1,16 @@
+/*! Task Orchestration Framework.
+
+This framework helps to organize the execution of a program
+into a live task graph. In this model, all the work is happening
+inside tasks, which are scheduled to run by the `Choir`.
+
+Lifetime of a Task:
+  1. Idle: task is just created.
+  2. Scheduled: no more dependencies can be added to the task.
+  3. Executing: task was dispatched from the queue by one of the workers.
+  4. Done: task is retired.
+!*/
+
 #![allow(
     renamed_and_removed_lints,
     clippy::new_without_default,
@@ -8,12 +21,14 @@
     clippy::unknown_clippy_lints
 )]
 #![warn(
+    missing_docs,
     trivial_casts,
     trivial_numeric_casts,
     unused_extern_crates,
     unused_qualifications,
     clippy::pattern_type_mismatch
 )]
+#![deny(unsafe)]
 
 use crossbeam_deque::{Injector, Steal};
 use std::{
@@ -147,11 +162,13 @@ pub struct Choir {
     next_id: AtomicUsize,
 }
 
+/// Handle object holding a worker thread alive.
 pub struct WorkerHandle {
     worker: Arc<Worker>,
     join_handle: Option<thread::JoinHandle<()>>,
 }
 
+/// Task that is created but not running yet.
 pub struct IdleTask {
     conductor: Arc<Conductor>,
     task: Arc<Task>,
@@ -163,6 +180,7 @@ impl AsRef<Mutex<Continuation>> for IdleTask {
     }
 }
 
+/// Task that is already scheduled for running.
 pub struct RunningTask {
     continuation: Arc<Mutex<Continuation>>,
 }
@@ -174,6 +192,7 @@ impl AsRef<Mutex<Continuation>> for RunningTask {
 }
 
 impl Choir {
+    /// Create a new task system.
     pub fn new() -> Self {
         let injector = Injector::new();
         Self {
@@ -189,6 +208,10 @@ impl Choir {
         }
     }
 
+    /// Add a new worker thread.
+    ///
+    /// Note: A system can't have more than `MAX_WORKERS` workers
+    /// enabled at any time.
     pub fn add_worker(&mut self, name: &str) -> WorkerHandle {
         let worker = Arc::new(Worker {
             name: name.to_string(),
@@ -209,6 +232,7 @@ impl Choir {
     }
 
     //Note: `Sync` doesn't seem necessary here, but Rust complains otherwise.
+    /// Internal method to create task data.
     fn create_task(&self, fun: impl FnOnce() + Send + Sync + 'static) -> Task {
         Task {
             id: self.next_id.fetch_add(1, Ordering::AcqRel),
@@ -220,6 +244,8 @@ impl Choir {
         }
     }
 
+    /// Create a task without scheduling it for running. This is used in order
+    /// to add dependencies before running the task.
     pub fn idle_task(&self, fun: impl FnOnce() + Send + Sync + 'static) -> IdleTask {
         IdleTask {
             conductor: Arc::clone(&self.conductor),
@@ -227,6 +253,7 @@ impl Choir {
         }
     }
 
+    /// Create a task without dependencies and run it instantly.
     pub fn run_task(&self, fun: impl FnOnce() + Send + Sync + 'static) -> RunningTask {
         const FALLBACK: bool = false;
         if FALLBACK {
@@ -240,8 +267,10 @@ impl Choir {
         }
     }
 
+    /// Block until the running queue is empty.
     pub fn wait_idle(&mut self) {
         while !self.conductor.injector.is_empty() || Arc::weak_count(&self.conductor.baton) != 0 {
+            //TODO: is there a better way?
             thread::sleep(Duration::from_millis(100));
         }
     }
@@ -257,6 +286,9 @@ impl Drop for WorkerHandle {
 }
 
 impl IdleTask {
+    /// Schedule this task for running.
+    ///
+    /// It will only be executed once the dependencies are fulfilled.
     pub fn run(self) -> RunningTask {
         let continuation = Arc::clone(&self.task.continuation);
         if let Ok(ready) = Arc::try_unwrap(self.task) {
@@ -265,6 +297,7 @@ impl IdleTask {
         RunningTask { continuation }
     }
 
+    /// Add a dependency on another task, which is possibly running.
     pub fn depend_on<C: AsRef<Mutex<Continuation>>>(&self, other: C) {
         match *other.as_ref().lock().unwrap() {
             Continuation::Playing {

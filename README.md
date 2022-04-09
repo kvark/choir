@@ -4,11 +4,11 @@
 [![Docs.rs](https://docs.rs/choir/badge.svg)](https://docs.rs/choir)
 [![Build Status](https://github.com/kvark/choir/workflows/pipeline/badge.svg)](https://github.com/kvark/choir/actions)
 ![MSRV](https://img.shields.io/badge/rustc-1.56+-blue.svg)
-[![codecov.io](https://codecov.io/gh/kvark/choir/branch/master/graph/badge.svg?token=9VOKYO8BM2)](https://codecov.io/gh/kvark/choir)
+[![codecov.io](https://codecov.io/gh/kvark/choir/branch/main/graph/badge.svg)](https://codecov.io/gh/kvark/choir)
 
 Choir is a task orchestration framework. It helps you to organize all the CPU workflow in terms of tasks.
 
-_Principles_ are simple: no unsafe code, and minimize the locking.
+_Principles_ are simple: no unsafe code, and minimize any locking in order to scale well.
 
 ### Example:
 ```rust
