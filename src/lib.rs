@@ -27,6 +27,7 @@ use std::{
 };
 
 const MAX_WORKERS: usize = mem::size_of::<usize>() * 8;
+const NO_WORKER: Option<WorkerContext> = None;
 
 #[doc(hidden)]
 pub enum Continuation {
@@ -50,14 +51,17 @@ struct Worker {
 }
 
 struct WorkerContext {
-    _inner: Arc<Worker>,
     thread: thread::Thread,
+}
+
+struct WorkerPool {
+    contexts: [Option<WorkerContext>; MAX_WORKERS],
 }
 
 struct Conductor {
     injector: Injector<Task>,
     //TODO: use a concurrent growable vector here
-    workers: RwLock<Vec<WorkerContext>>,
+    workers: RwLock<WorkerPool>,
     parked_mask: AtomicUsize,
     // A counter of all the tasks that are alive.
     baton: Arc<()>,
@@ -76,18 +80,18 @@ impl Conductor {
                 // everybody is busy, give up
                 break;
             }
-            let workers = self.workers.read().unwrap();
-            workers[index].thread.unpark();
+            let pool = self.workers.read().unwrap();
+            if let Some(context) = pool.contexts[index].as_ref() {
+                context.thread.unpark();
+            }
         }
     }
 
-    fn work_loop(&self, worker: Arc<Worker>) {
+    fn work_loop(&self, worker: &Worker) {
         let index = {
-            let mut workers = self.workers.write().unwrap();
-            let index = workers.len();
-            assert!(index < MAX_WORKERS);
-            workers.push(WorkerContext {
-                _inner: Arc::clone(&worker),
+            let mut pool = self.workers.write().unwrap();
+            let index = pool.contexts.iter_mut().position(|c| c.is_none()).unwrap();
+            pool.contexts[index] = Some(WorkerContext {
                 thread: thread::current(),
             });
             index
@@ -131,7 +135,9 @@ impl Conductor {
                 Steal::Retry => {}
             }
         }
+
         log::info!("Thread '{}' dies", worker.name);
+        self.workers.write().unwrap().contexts[index] = None;
     }
 }
 
@@ -173,7 +179,9 @@ impl Choir {
         Self {
             conductor: Arc::new(Conductor {
                 injector,
-                workers: RwLock::new(Vec::new()),
+                workers: RwLock::new(WorkerPool {
+                    contexts: [NO_WORKER; MAX_WORKERS],
+                }),
                 parked_mask: AtomicUsize::new(0),
                 baton: Arc::new(()),
             }),
@@ -191,7 +199,7 @@ impl Choir {
 
         let join_handle = thread::Builder::new()
             .name(name.to_string())
-            .spawn(move || conductor.work_loop(worker_clone))
+            .spawn(move || conductor.work_loop(&worker_clone))
             .unwrap();
 
         WorkerHandle {
