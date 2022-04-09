@@ -67,10 +67,15 @@ impl Conductor {
     fn schedule(&self, task: Task) {
         log::trace!("Task {} is scheduled", task.id);
         self.injector.push(task);
-        // Wake up the first sleeping thread.
-        let mask = self.parked_mask.load(Ordering::Relaxed);
-        let index = mask.trailing_zeros();
-        if index != MAX_SINGERS {
+        // Wake up threads until it's scheduled.
+        while !self.injector.is_empty() {
+            // Take the first sleeping thread.
+            let mask = self.parked_mask.load(Ordering::Relaxed);
+            let index = mask.trailing_zeros();
+            if index == MAX_SINGERS {
+                // everybody is busy, give up
+                break;
+            }
             let singers = self.singers.read().unwrap();
             singers[index as usize].thread.unpark();
         }
@@ -99,7 +104,9 @@ impl Conductor {
                 }
                 Steal::Success(task) => {
                     log::trace!("Thread '{}' runs task {}", singer.name, task.id);
+                    // execute the task
                     (task.song)();
+                    // mark the task as done
                     let dependents = match mem::replace(
                         &mut *task.continuation.lock().unwrap(),
                         Continuation::Done,
@@ -113,6 +120,7 @@ impl Conductor {
                         } => dependents,
                         Continuation::Done => unreachable!(),
                     };
+                    // unblock dependencies if needed
                     for task in dependents {
                         if let Ok(ready) = Arc::try_unwrap(task) {
                             self.schedule(ready);
