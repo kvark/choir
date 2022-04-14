@@ -282,7 +282,7 @@ impl Choir {
 
     /// Block until the running queue is empty.
     #[profiling::function]
-    pub fn wait_idle(&mut self) {
+    pub fn wait_idle(&self) {
         while !self.conductor.injector.is_empty() || Arc::weak_count(&self.conductor.baton) != 0 {
             //TODO: is there a better way?
             thread::sleep(Duration::from_millis(100));
