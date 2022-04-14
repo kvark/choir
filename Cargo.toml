@@ -11,9 +11,9 @@ categories = ["concurrency", "game-development"]
 
 [workspace]
 members = [
-	"examples",
+	"apps",
 ]
-default-members = ["examples"]
+default-members = ["apps"]
 
 [[bench]]
 name = "ballpark"
