@@ -36,6 +36,11 @@ jobs:
         with:
           command: test
           args: --all-features
+      - uses: actions-rs/cargo@v1
+        name: Build the bench
+        with:
+          command: bench
+          args: --no-run
   clippy:
     name: Clippy
     runs-on: ubuntu-latest

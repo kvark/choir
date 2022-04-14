@@ -9,11 +9,15 @@ repository = "https://github.com/kvark/choir"
 keywords = ["job-system", "tasks"]
 categories = ["concurrency", "game-development"]
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[[bench]]
+name = "ballpark"
+harness = false
 
 [dependencies]
 crossbeam-deque = "0.8"
 log = "0.4"
 
 [dev-dependencies]
+criterion = "0.3"
 env_logger = "0.9"
+num_cpus = "1"
