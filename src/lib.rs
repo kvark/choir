@@ -28,7 +28,7 @@ Lifetime of a Task:
     unused_qualifications,
     clippy::pattern_type_mismatch
 )]
-#![forbid(unsafe_code)]
+//#![forbid(unsafe_code)]
 
 use crossbeam_deque::{Injector, Steal};
 use std::{
@@ -53,10 +53,16 @@ pub enum Continuation {
     Done,
 }
 
+struct FnBox(Box<dyn FnOnce() + Send + 'static>);
+
+// This is totally safe. See:
+// https://internals.rust-lang.org/t/dyn-fnonce-should-always-be-sync/16470
+unsafe impl Sync for FnBox {}
+
 #[doc(hidden)]
 pub struct Task {
     id: usize,
-    fun: Box<dyn FnOnce() + Send + Sync + 'static>,
+    fun: FnBox,
     continuation: Arc<Mutex<Continuation>>,
 }
 
@@ -126,8 +132,8 @@ impl Conductor {
                     log::debug!("Task {} runs on thread '{}'", task.id, worker.name);
                     // execute the task
                     {
-                        profiling::scope!("run task");
-                        (task.fun)();
+                        profiling::scope!("execute");
+                        (task.fun.0)();
                     }
                     profiling::scope!("unblock dependencies");
                     // mark the task as done
@@ -237,12 +243,11 @@ impl Choir {
         }
     }
 
-    //Note: `Sync` doesn't seem necessary here, but Rust complains otherwise.
     /// Internal method to create task data.
-    fn create_task(&self, fun: impl FnOnce() + Send + Sync + 'static) -> Task {
+    fn create_task(&self, fun: impl FnOnce() + Send + 'static) -> Task {
         Task {
             id: self.next_id.fetch_add(1, Ordering::AcqRel),
-            fun: Box::new(fun),
+            fun: FnBox(Box::new(fun)),
             continuation: Arc::new(Mutex::new(Continuation::Playing {
                 dependents: Vec::new(),
                 baton: Arc::downgrade(&self.conductor.baton),
@@ -252,7 +257,7 @@ impl Choir {
 
     /// Create a task without scheduling it for running. This is used in order
     /// to add dependencies before running the task.
-    pub fn idle_task(&self, fun: impl FnOnce() + Send + Sync + 'static) -> IdleTask {
+    pub fn idle_task(&self, fun: impl FnOnce() + Send + 'static) -> IdleTask {
         IdleTask {
             conductor: Arc::clone(&self.conductor),
             task: Arc::new(self.create_task(fun)),
@@ -261,7 +266,7 @@ impl Choir {
 
     /// Create a task without dependencies and run it instantly.
     #[profiling::function]
-    pub fn run_task(&self, fun: impl FnOnce() + Send + Sync + 'static) -> RunningTask {
+    pub fn run_task(&self, fun: impl FnOnce() + Send + 'static) -> RunningTask {
         const FALLBACK: bool = false;
         if FALLBACK {
             self.idle_task(fun).run()
