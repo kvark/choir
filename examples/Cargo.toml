@@ -12,6 +12,7 @@ profiler-tracy = ["profiling/profile-with-tracy"]
 choir = { path = ".." }
 num_cpus = "1"
 profiling = "1"
+rand = "0.8"
 
 [[bin]]
 name = "qsort"

@@ -109,6 +109,7 @@ impl Conductor {
     }
 
     fn work_loop(&self, worker: &Worker) {
+        profiling::register_thread!();
         let index = {
             let mut pool = self.workers.write().unwrap();
             let index = pool.contexts.iter_mut().position(|c| c.is_none()).unwrap();
@@ -123,6 +124,7 @@ impl Conductor {
             match self.injector.steal() {
                 Steal::Empty => {
                     log::trace!("Thread '{}' sleeps", worker.name);
+                    profiling::scope!("park");
                     let mask = 1 << index;
                     self.parked_mask.fetch_or(mask, Ordering::Relaxed);
                     thread::park();
@@ -135,7 +137,7 @@ impl Conductor {
                         profiling::scope!("execute");
                         (task.fun.0)();
                     }
-                    profiling::scope!("unblock dependencies");
+                    profiling::scope!("unblock");
                     // mark the task as done
                     let dependents = match mem::replace(
                         &mut *task.continuation.lock().unwrap(),
@@ -223,8 +225,6 @@ impl Choir {
     /// Note: A system can't have more than `MAX_WORKERS` workers
     /// enabled at any time.
     pub fn add_worker(&mut self, name: &str) -> WorkerHandle {
-        profiling::register_thread!(name);
-
         let worker = Arc::new(Worker {
             name: name.to_string(),
             alive: AtomicBool::new(true),
@@ -269,6 +269,7 @@ impl Choir {
     pub fn run_task(&self, fun: impl FnOnce() + Send + 'static) -> RunningTask {
         const FALLBACK: bool = false;
         if FALLBACK {
+            // this path has roughly 50% more overhead
             self.idle_task(fun).run()
         } else {
             // fast path skips the making of `Arc<Task>`

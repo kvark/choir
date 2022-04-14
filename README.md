@@ -25,6 +25,17 @@ What makes Choir _elegant_? Generally when we need to encode the semantics of "w
 You can add or remove workers at any time to balance the system load that may be running other applications at the same time.
 
 ### TODO:
-  - benchmarking
   - loop detection
   - heavy use case
+
+
+## Rough numbers
+
+Machine: MBP 2016, 3.3 GHz Dual-Core Intel Core i7
+
+function `run_task` (optimized): 237ns
+function `run_task` (fallback): 401ns
+"is alive": 34ns
+"steal" task: 61ns
+empty "execute": 37ns
+dummy "unblock": 78ns
