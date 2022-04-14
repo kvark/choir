@@ -125,7 +125,11 @@ impl Conductor {
                 Steal::Success(task) => {
                     log::debug!("Task {} runs on thread '{}'", task.id, worker.name);
                     // execute the task
-                    (task.fun)();
+                    {
+                        profiling::scope!("run task");
+                        (task.fun)();
+                    }
+                    profiling::scope!("unblock dependencies");
                     // mark the task as done
                     let dependents = match mem::replace(
                         &mut *task.continuation.lock().unwrap(),
@@ -213,6 +217,8 @@ impl Choir {
     /// Note: A system can't have more than `MAX_WORKERS` workers
     /// enabled at any time.
     pub fn add_worker(&mut self, name: &str) -> WorkerHandle {
+        profiling::register_thread!(name);
+
         let worker = Arc::new(Worker {
             name: name.to_string(),
             alive: AtomicBool::new(true),
@@ -254,6 +260,7 @@ impl Choir {
     }
 
     /// Create a task without dependencies and run it instantly.
+    #[profiling::function]
     pub fn run_task(&self, fun: impl FnOnce() + Send + Sync + 'static) -> RunningTask {
         const FALLBACK: bool = false;
         if FALLBACK {
@@ -268,6 +275,7 @@ impl Choir {
     }
 
     /// Block until the running queue is empty.
+    #[profiling::function]
     pub fn wait_idle(&mut self) {
         while !self.conductor.injector.is_empty() || Arc::weak_count(&self.conductor.baton) != 0 {
             //TODO: is there a better way?

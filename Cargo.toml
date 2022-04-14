@@ -9,6 +9,12 @@ repository = "https://github.com/kvark/choir"
 keywords = ["job-system", "tasks"]
 categories = ["concurrency", "game-development"]
 
+[workspace]
+members = [
+	"examples",
+]
+default-members = ["examples"]
+
 [[bench]]
 name = "ballpark"
 harness = false
@@ -16,6 +22,7 @@ harness = false
 [dependencies]
 crossbeam-deque = "0.8"
 log = "0.4"
+profiling = "1"
 
 [dev-dependencies]
 criterion = "0.3"

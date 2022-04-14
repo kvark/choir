@@ -1,5 +1,9 @@
 # Change Log
 
+## v0.3 (TBD)
+  - profiling integration
+  - benchmarks
+
 ## v0.2 (10-04-2022)
   - task dependencies
   - proper names for things
