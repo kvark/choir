@@ -1,0 +1,18 @@
+[package]
+name = "choir-examples"
+version = "0.1.0"
+license = "MPL-2.0"
+edition = "2021"
+publish = false
+
+[features]
+profiler-tracy = ["profiling/profile-with-tracy"]
+
+[dependencies]
+choir = { path = ".." }
+num_cpus = "1"
+profiling = "1"
+
+[[bin]]
+name = "qsort"
+path = "qsort.rs"

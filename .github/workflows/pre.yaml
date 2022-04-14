@@ -1,6 +1,6 @@
 # Regular testing.
 name: Check
-on: [push, pull_request]
+on: [pull_request]
 
 jobs:
   test-msrv:
@@ -35,7 +35,7 @@ jobs:
         name: Test all features
         with:
           command: test
-          args: --all-features
+          args: --workspace --all-features
       - uses: actions-rs/cargo@v1
         name: Build the bench
         with:
