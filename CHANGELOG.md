@@ -1,6 +1,7 @@
 # Change Log
 
 ## v0.3 (TBD)
+  - no Sync bound
   - profiling integration
   - benchmarks
 

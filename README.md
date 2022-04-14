@@ -8,8 +8,6 @@
 
 Choir is a task orchestration framework. It helps you to organize all the CPU workflow in terms of tasks.
 
-_Principles_ are simple: no unsafe code, and minimize any locking in order to scale well.
-
 ### Example:
 ```rust
 let choir = choir::Choir::new();
