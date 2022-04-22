@@ -52,3 +52,21 @@ fn sequential() {
     choir.wait_idle();
     assert_eq!(*value.lock().unwrap(), n);
 }
+
+#[test]
+fn multi_sum() {
+    let _ = env_logger::try_init();
+    let mut choir = choir::Choir::new();
+    let _worker1 = choir.add_worker("A");
+    let _worker2 = choir.add_worker("B");
+
+    let value = Arc::new(AtomicUsize::new(0));
+    let value_other = Arc::clone(&value);
+    let n = 100;
+    choir.run_multi_task(n, move |i| {
+        println!("Adding {}", i);
+        value_other.fetch_add(i as usize, Ordering::SeqCst);
+    });
+    choir.wait_idle();
+    assert_eq!(value.load(Ordering::Acquire) as u32, (n - 1) * n / 2);
+}

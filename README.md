@@ -24,10 +24,16 @@ What makes Choir _elegant_? Generally when we need to encode the semantics of "w
 
 You can add or remove workers at any time to balance the system load that may be running other applications at the same time.
 
+## API
+
+General workflow is about creating tasks and setting up dependencies between them. If a task doesn't have any dependencies, it can be created and ran with `choir.run_task()`. Otherwise, it should be created as `choir.idle_task()` and then scheduled for execution by `idle_task.run()`.
+
+Simple tasks are executed once and represented as `FnOnce()`.
+In addition, Choir supports multi-tasks, which execute the selected number of times. They are represented as `Fn(SubIndex)`, and can be created as `idle_multi_task`/`run_multi_task`. Note that multi-tasks are going to be pre-empted by other tasks naturally due to the implementation.
+
 ### TODO:
   - loop detection
   - heavy use case
-
 
 ## Rough numbers
 
