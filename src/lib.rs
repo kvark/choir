@@ -32,7 +32,7 @@ Lifetime of a Task:
 
 use crossbeam_deque::{Injector, Steal};
 use std::{
-    mem,
+    mem, ops,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex, RwLock, Weak,
@@ -53,16 +53,25 @@ pub enum Continuation {
     Done,
 }
 
-struct FnBox(Box<dyn FnOnce() + Send + 'static>);
+/// Index of a sub-task inside a multi-task.
+pub type SubIndex = u32;
+
+enum Functor {
+    Single(Box<dyn FnOnce() + Send + 'static>),
+    Multi(
+        ops::Range<SubIndex>,
+        Arc<dyn Fn(SubIndex) + Send + Sync + 'static>,
+    ),
+}
 
 // This is totally safe. See:
 // https://internals.rust-lang.org/t/dyn-fnonce-should-always-be-sync/16470
-unsafe impl Sync for FnBox {}
+unsafe impl Sync for Functor {}
 
 #[doc(hidden)]
 pub struct Task {
     id: usize,
-    fun: FnBox,
+    functor: Functor,
     continuation: Arc<Mutex<Continuation>>,
 }
 
@@ -79,9 +88,14 @@ struct WorkerPool {
     contexts: [Option<WorkerContext>; MAX_WORKERS],
 }
 
+impl WorkerPool {
+    fn count_alive(&self) -> usize {
+        self.contexts.iter().filter(|c| c.is_some()).count()
+    }
+}
+
 struct Conductor {
     injector: Injector<Task>,
-    //TODO: use a concurrent growable vector here
     workers: RwLock<WorkerPool>,
     parked_mask: AtomicUsize,
     // A counter of all the tasks that are alive.
@@ -104,6 +118,63 @@ impl Conductor {
             let pool = self.workers.read().unwrap();
             if let Some(context) = pool.contexts[index].as_ref() {
                 context.thread.unpark();
+            }
+        }
+    }
+
+    fn execute(&self, task: Task, worker_name: &str) -> Option<Arc<Mutex<Continuation>>> {
+        match task.functor {
+            Functor::Single(fun) => {
+                log::debug!("Task {} runs on thread '{}'", task.id, worker_name);
+                profiling::scope!("execute");
+                (fun)();
+                Some(task.continuation)
+            }
+            Functor::Multi(sub_range, fun) => {
+                log::debug!(
+                    "Task {} [{}] runs on thread '{}'",
+                    task.id,
+                    sub_range.start,
+                    worker_name,
+                );
+                debug_assert!(sub_range.start < sub_range.end);
+                // fun the functor
+                (fun)(sub_range.start);
+                // are we done yet?
+                if sub_range.start + 1 == sub_range.end {
+                    Some(task.continuation)
+                } else {
+                    // Put it back to the queue, with the next sub-index.
+                    // Note: we aren't calling `schedule` because we know at least this very thread
+                    // will be able to pick it up, so no need to wake up anybody.
+                    self.injector.push(Task {
+                        id: task.id,
+                        functor: Functor::Multi(sub_range.start + 1..sub_range.end, fun),
+                        continuation: task.continuation,
+                    });
+                    None
+                }
+            }
+        }
+    }
+
+    fn finish(&self, continuation: &mut Continuation) {
+        profiling::scope!("unblock");
+        // mark the task as done
+        let dependents = match mem::replace(continuation, Continuation::Done) {
+            //Note: it's fine at this point to drop `baton`:
+            // if it's the last task, we don't have any dependencies anyway.
+            // Otherwise, the dependencies will have batons of their own.
+            Continuation::Playing {
+                dependents,
+                baton: _,
+            } => dependents,
+            Continuation::Done => unreachable!(),
+        };
+        // unblock dependencies if needed
+        for dependent in dependents {
+            if let Ok(ready) = Arc::try_unwrap(dependent) {
+                self.schedule(ready);
             }
         }
     }
@@ -131,32 +202,8 @@ impl Conductor {
                     self.parked_mask.fetch_and(!mask, Ordering::Relaxed);
                 }
                 Steal::Success(task) => {
-                    log::debug!("Task {} runs on thread '{}'", task.id, worker.name);
-                    // execute the task
-                    {
-                        profiling::scope!("execute");
-                        (task.fun.0)();
-                    }
-                    profiling::scope!("unblock");
-                    // mark the task as done
-                    let dependents = match mem::replace(
-                        &mut *task.continuation.lock().unwrap(),
-                        Continuation::Done,
-                    ) {
-                        //Note: it's fine at this point to drop `baton`:
-                        // if it's the last task, we don't have any dependencies anyway.
-                        // Otherwise, the dependencies will have batons of their own.
-                        Continuation::Playing {
-                            dependents,
-                            baton: _,
-                        } => dependents,
-                        Continuation::Done => unreachable!(),
-                    };
-                    // unblock dependencies if needed
-                    for task in dependents {
-                        if let Ok(ready) = Arc::try_unwrap(task) {
-                            self.schedule(ready);
-                        }
+                    if let Some(continuation) = self.execute(task, &worker.name) {
+                        self.finish(&mut *continuation.lock().unwrap());
                     }
                 }
                 Steal::Retry => {}
@@ -192,6 +239,23 @@ impl AsRef<Mutex<Continuation>> for IdleTask {
     }
 }
 
+/// Multi-task that is created but not running yet.
+pub struct IdleMultiTask {
+    conductor: Arc<Conductor>,
+    //Note: we could technically use `SmallVec<[Arc<Task>; 1]>` here
+    // to merge this with `IdleTask`.
+    tasks: Vec<Arc<Task>>,
+    // This is technically redundant, it's the same for all tasks.
+    // But we have to produce an extra anyway, and it's convenient to keep it here.
+    continuation: Arc<Mutex<Continuation>>,
+}
+
+impl AsRef<Mutex<Continuation>> for IdleMultiTask {
+    fn as_ref(&self) -> &Mutex<Continuation> {
+        &self.continuation
+    }
+}
+
 /// Task that is already scheduled for running.
 pub struct RunningTask {
     continuation: Arc<Mutex<Continuation>>,
@@ -202,6 +266,8 @@ impl AsRef<Mutex<Continuation>> for RunningTask {
         &self.continuation
     }
 }
+
+const RUN_FALLBACK: bool = false;
 
 impl Choir {
     /// Create a new task system.
@@ -245,14 +311,49 @@ impl Choir {
 
     /// Internal method to create task data.
     fn create_task(&self, fun: impl FnOnce() + Send + 'static) -> Task {
+        let id = self.next_id.fetch_add(1, Ordering::AcqRel);
+        log::trace!("Creating task {}", id);
         Task {
-            id: self.next_id.fetch_add(1, Ordering::AcqRel),
-            fun: FnBox(Box::new(fun)),
+            id,
+            functor: Functor::Single(Box::new(fun)),
             continuation: Arc::new(Mutex::new(Continuation::Playing {
                 dependents: Vec::new(),
                 baton: Arc::downgrade(&self.conductor.baton),
             })),
         }
+    }
+
+    /// Internal method to create multi-task data.
+    fn create_multi_task(
+        &self,
+        count: SubIndex,
+        fun: impl Fn(SubIndex) + Send + Sync + 'static,
+    ) -> (Arc<Mutex<Continuation>>, impl Iterator<Item = Task>) {
+        let id = self.next_id.fetch_add(1, Ordering::AcqRel);
+        let worker_count = self.conductor.workers.read().unwrap().count_alive();
+        let groups = (worker_count as SubIndex).max(1).min(count);
+        log::trace!(
+            "Creating task {} with {} instances over {} groups",
+            id,
+            count,
+            groups
+        );
+        let continuation = Arc::new(Mutex::new(Continuation::Playing {
+            dependents: Vec::new(),
+            baton: Arc::downgrade(&self.conductor.baton),
+        }));
+        let continuation_clone = Arc::clone(&continuation);
+        #[allow(trivial_casts)] // false-positive
+        let arc_fun = Arc::new(fun) as _;
+        let iterator = (0..groups).map(move |i| Task {
+            id,
+            functor: Functor::Multi(
+                (count * i / groups)..(count * (i + 1) / groups),
+                Arc::clone(&arc_fun),
+            ),
+            continuation: Arc::clone(&continuation),
+        });
+        (continuation_clone, iterator)
     }
 
     /// Create a task without scheduling it for running. This is used in order
@@ -264,11 +365,25 @@ impl Choir {
         }
     }
 
+    /// Create a multi-task without scheduling it for running.
+    /// This is used in order to add dependencies before running the task.
+    pub fn idle_multi_task(
+        &self,
+        count: SubIndex,
+        fun: impl Fn(SubIndex) + Send + Sync + 'static,
+    ) -> IdleMultiTask {
+        let (continuation, task_iter) = self.create_multi_task(count, fun);
+        IdleMultiTask {
+            conductor: Arc::clone(&self.conductor),
+            tasks: task_iter.map(Arc::new).collect(),
+            continuation,
+        }
+    }
+
     /// Create a task without dependencies and run it instantly.
     #[profiling::function]
     pub fn run_task(&self, fun: impl FnOnce() + Send + 'static) -> RunningTask {
-        const FALLBACK: bool = false;
-        if FALLBACK {
+        if RUN_FALLBACK {
             // this path has roughly 50% more overhead
             self.idle_task(fun).run()
         } else {
@@ -276,6 +391,26 @@ impl Choir {
             let task = self.create_task(fun);
             let continuation = Arc::clone(&task.continuation);
             self.conductor.schedule(task);
+            RunningTask { continuation }
+        }
+    }
+
+    /// Create a mukti-task without dependencies and run it instantly.
+    #[profiling::function]
+    pub fn run_multi_task(
+        &self,
+        count: SubIndex,
+        fun: impl Fn(SubIndex) + Send + Sync + 'static,
+    ) -> RunningTask {
+        if RUN_FALLBACK {
+            // this path has roughly 50% more overhead
+            self.idle_multi_task(count, fun).run()
+        } else {
+            // fast path skips the making of `Arc<Task>` as well as the `Vec`
+            let (continuation, task_iter) = self.create_multi_task(count, fun);
+            for task in task_iter {
+                self.conductor.schedule(task);
+            }
             RunningTask { continuation }
         }
     }
@@ -328,3 +463,32 @@ impl IdleTask {
 // Note: would be nice to log the dropping of `IdleTask`,
 // but currently unable to implement `drop` because it's getting
 // destructured in `IdleTask::run()`.
+
+impl IdleMultiTask {
+    /// Schedule this multi-task for running.
+    ///
+    /// It will only be executed once the dependencies are fulfilled.
+    pub fn run(self) -> RunningTask {
+        for task in self.tasks {
+            if let Ok(ready) = Arc::try_unwrap(task) {
+                self.conductor.schedule(ready);
+            }
+        }
+        RunningTask {
+            continuation: self.continuation,
+        }
+    }
+
+    /// Add a dependency on another task, which is possibly running.
+    pub fn depend_on<C: AsRef<Mutex<Continuation>>>(&self, other: C) {
+        match *other.as_ref().lock().unwrap() {
+            Continuation::Playing {
+                ref mut dependents,
+                baton: _,
+            } => {
+                dependents.extend(self.tasks.iter().map(Arc::clone));
+            }
+            Continuation::Done => {}
+        }
+    }
+}

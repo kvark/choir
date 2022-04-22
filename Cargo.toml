@@ -13,7 +13,6 @@ categories = ["concurrency", "game-development"]
 members = [
 	"apps",
 ]
-default-members = ["apps"]
 
 [[bench]]
 name = "ballpark"
