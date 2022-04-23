@@ -102,11 +102,11 @@ impl Conductor {
         self.injector.push(task);
         // Wake up threads until it's scheduled.
         while !self.injector.is_empty() {
+            let mask = self.parked_mask.load(Ordering::Acquire);
             // Take the first sleeping thread.
-            let mask = self.parked_mask.load(Ordering::Relaxed);
             let index = mask.trailing_zeros() as usize;
             if index == MAX_WORKERS {
-                // everybody is busy, give up
+                log::trace!("\teverybody is busy...");
                 break;
             }
             let pool = self.workers.read().unwrap();
@@ -135,7 +135,7 @@ impl Conductor {
                 let middle = (sub_range.end + sub_range.start) >> 1;
                 // split the task if needed
                 if middle != sub_range.start {
-                    let mask = self.parked_mask.load(Ordering::Relaxed);
+                    let mask = self.parked_mask.load(Ordering::Acquire);
                     let index = mask.trailing_zeros() as usize;
                     if index != MAX_WORKERS {
                         log::trace!(
@@ -214,15 +214,18 @@ impl Conductor {
         while worker.alive.load(Ordering::Acquire) {
             match self.injector.steal() {
                 Steal::Empty => {
-                    //BUG: if stealing fails, it should atomically switch to
-                    // the parked state. Otherwise, there is a race condition:
-                    // another worker may assume this one is in the loop.
                     log::trace!("Thread[{}] sleeps", index);
-                    profiling::scope!("park");
                     let mask = 1 << index;
-                    self.parked_mask.fetch_or(mask, Ordering::Relaxed);
-                    thread::park();
-                    self.parked_mask.fetch_and(!mask, Ordering::Relaxed);
+                    self.parked_mask.fetch_or(mask, Ordering::AcqRel);
+                    //Note: this is a situation where we are about to sleep,
+                    // and a new task is being scheduled at the same time.
+                    if self.injector.is_empty() {
+                        profiling::scope!("park");
+                        thread::park();
+                    } else {
+                        log::trace!("\tno, queue is not empty");
+                    }
+                    self.parked_mask.fetch_and(!mask, Ordering::AcqRel);
                 }
                 Steal::Success(task) => {
                     if let Some(continuation) = self.execute(task, index) {
