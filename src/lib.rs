@@ -35,21 +35,17 @@ use std::{
     mem, ops,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc, Mutex, RwLock, Weak,
+        Arc, Mutex, RwLock,
     },
     thread,
     time::Duration,
 };
 
 const MAX_WORKERS: usize = mem::size_of::<usize>() * 8;
-const NO_WORKER: Option<WorkerContext> = None;
 
 #[doc(hidden)]
 pub enum Continuation {
-    Playing {
-        dependents: Vec<Arc<Task>>,
-        baton: Weak<()>,
-    },
+    Playing { dependents: Vec<Arc<Task>> },
     Done,
 }
 
@@ -92,11 +88,19 @@ struct Conductor {
     injector: Injector<Task>,
     workers: RwLock<WorkerPool>,
     parked_mask: AtomicUsize,
-    // A counter of all the tasks that are alive.
-    baton: Arc<()>,
 }
 
 impl Conductor {
+    fn is_busy(&self) -> bool {
+        !self.injector.is_empty() || {
+            let pool = self.workers.read().unwrap();
+            let workers_mask = pool.contexts.iter().rev().fold(0usize, |mask, w| {
+                (mask << 1) | if w.is_some() { 1 } else { 0 }
+            });
+            workers_mask != self.parked_mask.load(Ordering::Acquire)
+        }
+    }
+
     fn schedule(&self, task: Task) {
         log::trace!("Task {} is scheduled", task.id);
         self.injector.push(task);
@@ -182,13 +186,7 @@ impl Conductor {
         profiling::scope!("unblock");
         // mark the task as done
         let dependents = match mem::replace(continuation, Continuation::Done) {
-            //Note: it's fine at this point to drop `baton`:
-            // if it's the last task, we don't have any dependencies anyway.
-            // Otherwise, the dependencies will have batons of their own.
-            Continuation::Playing {
-                dependents,
-                baton: _,
-            } => dependents,
+            Continuation::Playing { dependents } => dependents,
             Continuation::Done => unreachable!(),
         };
         // unblock dependencies if needed
@@ -281,6 +279,7 @@ const RUN_FALLBACK: bool = false;
 impl Choir {
     /// Create a new task system.
     pub fn new() -> Self {
+        const NO_WORKER: Option<WorkerContext> = None;
         let injector = Injector::new();
         Self {
             conductor: Arc::new(Conductor {
@@ -289,7 +288,6 @@ impl Choir {
                     contexts: [NO_WORKER; MAX_WORKERS],
                 }),
                 parked_mask: AtomicUsize::new(0),
-                baton: Arc::new(()),
             }),
             next_id: AtomicUsize::new(1),
         }
@@ -327,7 +325,6 @@ impl Choir {
             functor,
             continuation: Arc::new(Mutex::new(Continuation::Playing {
                 dependents: Vec::new(),
-                baton: Arc::downgrade(&self.conductor.baton),
             })),
         }
     }
@@ -396,7 +393,7 @@ impl Choir {
     /// Block until the running queue is empty.
     #[profiling::function]
     pub fn wait_idle(&self) {
-        while !self.conductor.injector.is_empty() || Arc::weak_count(&self.conductor.baton) != 0 {
+        while self.conductor.is_busy() {
             //TODO: is there a better way?
             thread::sleep(Duration::from_millis(100));
         }
@@ -427,10 +424,7 @@ impl IdleTask {
     /// Add a dependency on another task, which is possibly running.
     pub fn depend_on<C: AsRef<Mutex<Continuation>>>(&self, other: C) {
         match *other.as_ref().lock().unwrap() {
-            Continuation::Playing {
-                ref mut dependents,
-                baton: _,
-            } => {
+            Continuation::Playing { ref mut dependents } => {
                 dependents.push(Arc::clone(&self.task));
             }
             Continuation::Done => {}
