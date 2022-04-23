@@ -138,18 +138,18 @@ impl Conductor {
                 // split the task if needed
                 if middle != sub_range.start {
                     let mask = self.parked_mask.load(Ordering::Acquire);
-                    let index = mask.trailing_zeros() as usize;
-                    if index != MAX_WORKERS {
-                        log::trace!(
-                            "\tsplitting out {:?} for thread[{}]",
-                            middle..sub_range.end,
-                            index
-                        );
+                    if mask != 0 {
                         self.injector.push(Task {
                             id: task.id,
                             functor: Functor::Multi(middle..sub_range.end, Arc::clone(&fun)),
                             continuation: Arc::clone(&task.continuation),
                         });
+                        let index = mask.trailing_zeros() as usize;
+                        log::trace!(
+                            "\tsplit out {:?} for thread[{}]",
+                            middle..sub_range.end,
+                            index
+                        );
                         sub_range.end = middle;
                         // wake up the worker
                         let pool = self.workers.read().unwrap();

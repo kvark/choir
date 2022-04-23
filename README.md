@@ -34,14 +34,18 @@ In addition, Choir supports multi-tasks, which execute the selected number of ti
 ### TODO:
   - loop detection
   - heavy use case
+  - loom testing
 
 ## Rough numbers
 
 Machine: MBP 2016, 3.3 GHz Dual-Core Intel Core i7
 
-function `run_task` (optimized): 237ns
-function `run_task` (fallback): 401ns
-"is alive": 34ns
-"steal" task: 61ns
-empty "execute": 37ns
-dummy "unblock": 78ns
+- function `run_task` (optimized): 237ns
+- function `run_task` (fallback): 401ns
+- "steal" task: 61ns
+- empty "execute": 37ns
+- dummy "unblock": 78ns
+
+Executing 100k empty tasks:
+- individually: 28ms
+- as a multi-task: 6ms

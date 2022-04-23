@@ -1,6 +1,6 @@
 # Change Log
 
-## v0.3 (TBD)
+## v0.3 (23-04-2022)
   - no `Sync` bound
   - multi-tasks
   - profiling integration
