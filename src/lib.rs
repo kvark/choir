@@ -106,17 +106,10 @@ impl Conductor {
     fn schedule(&self, task: Task) {
         log::trace!("Task {} is scheduled", task.id);
         self.injector.push(task);
-        // Wake up threads until it's scheduled.
-        profiling::scope!("wake up");
-        //TODO: this is unnecessarily slow, need to rethink it
-        while !self.injector.is_empty() {
-            let mask = self.parked_mask.load(Ordering::Acquire);
-            // Take the first sleeping thread.
+        // Wake up a thread if there is a sleeping one.
+        let mask = self.parked_mask.load(Ordering::Acquire);
+        if mask != 0 {
             let index = mask.trailing_zeros() as usize;
-            if index == MAX_WORKERS {
-                log::trace!("\teverybody is busy...");
-                break;
-            }
             profiling::scope!("unpark");
             let pool = self.workers.read().unwrap();
             if let Some(context) = pool.contexts[index].as_ref() {
