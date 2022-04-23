@@ -1,7 +1,7 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 
 fn many_tasks(c: &mut Criterion) {
-    const TASK_COUNT: choir::SubIndex = 100000;
+    const TASK_COUNT: choir::SubIndex = 100_000;
     c.bench_function("individual tasks: single worker", |b| {
         let mut choir = choir::Choir::new();
         let _worker = choir.add_worker("main");
