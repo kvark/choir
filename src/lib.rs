@@ -38,7 +38,6 @@ use std::{
         Arc, Mutex, RwLock,
     },
     thread,
-    time::Duration,
 };
 
 const MAX_WORKERS: usize = mem::size_of::<usize>() * 8;
@@ -88,16 +87,19 @@ struct Conductor {
     injector: Injector<Task>,
     workers: RwLock<WorkerPool>,
     parked_mask: AtomicUsize,
+    main_thread: thread::Thread,
 }
 
 impl Conductor {
     fn is_busy(&self) -> bool {
-        !self.injector.is_empty() || {
+        if self.injector.is_empty() {
             let pool = self.workers.read().unwrap();
             let workers_mask = pool.contexts.iter().rev().fold(0usize, |mask, w| {
                 (mask << 1) | if w.is_some() { 1 } else { 0 }
             });
             workers_mask != self.parked_mask.load(Ordering::Acquire)
+        } else {
+            true
         }
     }
 
@@ -105,6 +107,8 @@ impl Conductor {
         log::trace!("Task {} is scheduled", task.id);
         self.injector.push(task);
         // Wake up threads until it's scheduled.
+        profiling::scope!("wake up");
+        //TODO: this is unnecessarily slow, need to rethink it
         while !self.injector.is_empty() {
             let mask = self.parked_mask.load(Ordering::Acquire);
             // Take the first sleeping thread.
@@ -113,6 +117,7 @@ impl Conductor {
                 log::trace!("\teverybody is busy...");
                 break;
             }
+            profiling::scope!("unpark");
             let pool = self.workers.read().unwrap();
             if let Some(context) = pool.contexts[index].as_ref() {
                 context.thread.unpark();
@@ -219,6 +224,7 @@ impl Conductor {
                     // and a new task is being scheduled at the same time.
                     if self.injector.is_empty() {
                         profiling::scope!("park");
+                        self.main_thread.unpark();
                         thread::park();
                     } else {
                         log::trace!("\tno, queue is not empty");
@@ -288,6 +294,7 @@ impl Choir {
                     contexts: [NO_WORKER; MAX_WORKERS],
                 }),
                 parked_mask: AtomicUsize::new(0),
+                main_thread: thread::current(),
             }),
             next_id: AtomicUsize::new(1),
         }
@@ -393,9 +400,10 @@ impl Choir {
     /// Block until the running queue is empty.
     #[profiling::function]
     pub fn wait_idle(&self) {
+        assert_eq!(thread::current().id(), self.conductor.main_thread.id());
         while self.conductor.is_busy() {
-            //TODO: is there a better way?
-            thread::sleep(Duration::from_millis(100));
+            // will be woken up by workers finishing
+            thread::park();
         }
     }
 }
