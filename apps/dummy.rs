@@ -1,0 +1,10 @@
+fn main() {
+    let mut choir = choir::Choir::new();
+    let _workers = (0..2)
+        .map(|i| choir.add_worker(&format!("worker-{}", i)))
+        .collect::<Vec<_>>();
+    for _ in 0..1000000 {
+        choir.run_task(|| {});
+    }
+    choir.wait_idle();
+}

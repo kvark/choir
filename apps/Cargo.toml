@@ -17,3 +17,7 @@ rand = "0.8"
 [[bin]]
 name = "qsort"
 path = "qsort.rs"
+
+[[bin]]
+name = "dummy"
+path = "dummy.rs"
