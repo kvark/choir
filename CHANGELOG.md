@@ -1,7 +1,8 @@
 # Change Log
 
 ## v0.3 (TBD)
-  - no Sync bound
+  - no `Sync` bound
+  - multi-tasks
   - profiling integration
   - benchmarks
 

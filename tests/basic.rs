@@ -64,7 +64,6 @@ fn multi_sum() {
     let value_other = Arc::clone(&value);
     let n = 100;
     choir.run_multi_task(n, move |i| {
-        println!("Adding {}", i);
         value_other.fetch_add(i as usize, Ordering::SeqCst);
     });
     choir.wait_idle();
