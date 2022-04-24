@@ -38,15 +38,20 @@ pub mod arc;
 /// Additional utilities.
 pub mod util;
 
+#[cfg(feature = "loom")]
+use loom::{sync, thread};
+#[cfg(not(feature = "loom"))]
+use std::{sync, thread};
+
 use self::arc::Linearc;
 use crossbeam_deque::{Injector, Steal};
 use std::{
     fmt, mem, ops,
-    sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc, Mutex, RwLock,
-    },
-    thread, time,
+    time,
+};
+use self::sync::{
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    Arc, Mutex, RwLock,
 };
 
 const BITS_PER_BYTE: usize = 8;
@@ -206,6 +211,7 @@ impl Conductor {
                 if middle != sub_range.start {
                     let mask = self.parked_mask.load(Ordering::Acquire);
                     if mask != 0 {
+                        profiling::scope!("branch");
                         self.injector.push(Task {
                             functor: Functor::Multi(middle..sub_range.end, Linearc::clone(&fun)),
                             notifier: Arc::clone(&task.notifier),
