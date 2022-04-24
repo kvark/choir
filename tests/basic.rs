@@ -1,9 +1,23 @@
-use std::sync::{
+#[cfg(feature = "loom")]
+use loom::sync;
+#[cfg(not(feature = "loom"))]
+use std::sync;
+
+use self::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc, Mutex,
 };
 
+#[cfg(feature = "loom")]
 #[test]
+fn loom() {
+    //loom::model(parallel);
+    loom::model(sequential);
+    //loom::model(multi_sum);
+    loom::model(iter_xor);
+}
+
+#[cfg_attr(not(feature = "loom"), test)]
 fn parallel() {
     let _ = env_logger::try_init();
     let mut choir = choir::Choir::new();
@@ -25,7 +39,7 @@ fn parallel() {
     assert_eq!(value.load(Ordering::Acquire), n);
 }
 
-#[test]
+#[cfg_attr(not(feature = "loom"), test)]
 fn sequential() {
     let _ = env_logger::try_init();
     let mut choir = choir::Choir::new();
@@ -52,7 +66,7 @@ fn sequential() {
     assert_eq!(*value.lock().unwrap(), n);
 }
 
-#[test]
+#[cfg_attr(not(feature = "loom"), test)]
 fn multi_sum() {
     let _ = env_logger::try_init();
     let mut choir = choir::Choir::new();
@@ -69,7 +83,7 @@ fn multi_sum() {
     assert_eq!(value.load(Ordering::Acquire) as u32, (n - 1) * n / 2);
 }
 
-#[test]
+#[cfg_attr(not(feature = "loom"), test)]
 fn iter_xor() {
     let _ = env_logger::try_init();
     let mut choir = choir::Choir::new();
