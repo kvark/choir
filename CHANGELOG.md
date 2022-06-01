@@ -1,9 +1,9 @@
 # Change Log
 
 ## v0.4 (01-06-2022)
-  - iterated tasks
-  - schedule on drop
-  - remove `run_xx` calls
+  - iterator tasks support
+  - auto-schedule idle tasks on drop
+  - replace `run_xx` and `idle_xx` calls by just `add_xx`
 
 ## v0.3 (23-04-2022)
   - no `Sync` bound
