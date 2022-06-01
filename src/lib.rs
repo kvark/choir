@@ -253,15 +253,52 @@ pub struct WorkerHandle {
     join_handle: Option<thread::JoinHandle<()>>,
 }
 
+enum MaybeArc<T> {
+    Unique(T),
+    Shared(Arc<T>),
+    Null,
+}
+
+impl<T> MaybeArc<T> {
+    fn new(value: T) -> Self {
+        Self::Unique(value)
+    }
+
+    fn share(&mut self) -> Arc<T> {
+        let arc = match mem::replace(self, Self::Null) {
+            Self::Unique(value) => Arc::new(value),
+            Self::Shared(arc) => arc,
+            Self::Null => unreachable!(),
+        };
+        *self = Self::Shared(Arc::clone(&arc));
+        arc
+    }
+
+    fn as_ref(&self) -> &T {
+        match *self {
+            Self::Unique(ref value) => value,
+            Self::Shared(ref arc) => arc,
+            Self::Null => unreachable!(),
+        }
+    }
+
+    fn extract(self) -> Option<T> {
+        match self {
+            Self::Unique(value) => Some(value),
+            _ => None,
+        }
+    }
+}
+
 /// Task that is created but not running yet.
 pub struct IdleTask {
     conductor: Arc<Conductor>,
-    task: Arc<Task>,
+    task: MaybeArc<Task>,
 }
 
 impl AsRef<Mutex<Continuation>> for IdleTask {
     fn as_ref(&self) -> &Mutex<Continuation> {
-        &self.task.continuation
+        &self.task.as_ref().continuation
     }
 }
 
@@ -275,8 +312,6 @@ impl AsRef<Mutex<Continuation>> for RunningTask {
         &self.continuation
     }
 }
-
-const RUN_FALLBACK: bool = false;
 
 impl Choir {
     /// Create a new task system.
@@ -332,19 +367,19 @@ impl Choir {
         }
     }
 
-    /// Create a task without scheduling it for running.
-    /// This is used in order to add dependencies before running the task.
-    pub fn idle_task(&self, fun: impl FnOnce() + Send + 'static) -> IdleTask {
+    /// Add a simple task.
+    #[profiling::function]
+    pub fn add_task(&self, fun: impl FnOnce() + Send + 'static) -> IdleTask {
         let task = self.create_task(Functor::Single(Box::new(fun)));
         IdleTask {
             conductor: Arc::clone(&self.conductor),
-            task: Arc::new(task),
+            task: MaybeArc::new(task),
         }
     }
 
-    /// Create a multi-task without scheduling it for running.
-    /// This is used in order to add dependencies before running the task.
-    pub fn idle_multi_task(
+    /// Add a task that's executed multiple times.
+    #[profiling::function]
+    pub fn add_multi_task(
         &self,
         count: SubIndex,
         fun: impl Fn(SubIndex) + Send + Sync + 'static,
@@ -354,55 +389,20 @@ impl Choir {
         log::trace!("\twith {} instances", count);
         IdleTask {
             conductor: Arc::clone(&self.conductor),
-            task: Arc::new(task),
+            task: MaybeArc::new(task),
         }
     }
 
-    /// Create a task without dependencies and run it instantly.
+    /// Add a task that's executed on a finite iterator of values.
     #[profiling::function]
-    pub fn run_task(&self, fun: impl FnOnce() + Send + 'static) -> RunningTask {
-        if RUN_FALLBACK {
-            // this path has roughly 50% more overhead
-            self.idle_task(fun).run()
-        } else {
-            // fast path skips the making of `Arc<Task>`
-            let task = self.create_task(Functor::Single(Box::new(fun)));
-            let continuation = Arc::clone(&task.continuation);
-            self.conductor.schedule(task);
-            RunningTask { continuation }
-        }
-    }
-
-    /// Create a mukti-task without dependencies and run it instantly.
-    #[profiling::function]
-    pub fn run_multi_task(
-        &self,
-        count: SubIndex,
-        fun: impl Fn(SubIndex) + Send + Sync + 'static,
-    ) -> RunningTask {
-        if RUN_FALLBACK {
-            // this path has roughly 50% more overhead
-            self.idle_multi_task(count, fun).run()
-        } else {
-            // fast path skips the making of `Arc<Task>`
-            assert_ne!(count, 0);
-            let task = self.create_task(Functor::Multi(0..count, Arc::new(fun)));
-            let continuation = Arc::clone(&task.continuation);
-            self.conductor.schedule(task);
-            RunningTask { continuation }
-        }
-    }
-
-    /// Create a mukti-task without dependencies and run it instantly.
-    #[profiling::function]
-    pub fn run_iter_task<I, F>(&self, iter: I, fun: F) -> RunningTask
+    pub fn add_iter_task<I, F>(&self, iter: I, fun: F) -> IdleTask
     where
         I: Iterator,
         I::Item: Send + 'static,
         F: Fn(I::Item) + Send + Sync + 'static,
     {
         let task_data = iter.collect::<util::PerTaskData<_>>();
-        self.run_multi_task(task_data.len(), move |index| unsafe {
+        self.add_multi_task(task_data.len(), move |index| unsafe {
             fun(task_data.take(index))
         })
     }
@@ -432,18 +432,18 @@ impl IdleTask {
     ///
     /// It will only be executed once the dependencies are fulfilled.
     pub fn run(self) -> RunningTask {
-        let continuation = Arc::clone(&self.task.continuation);
-        if let Ok(ready) = Arc::try_unwrap(self.task) {
+        let continuation = Arc::clone(&self.task.as_ref().continuation);
+        if let Some(ready) = self.task.extract() {
             self.conductor.schedule(ready);
         }
         RunningTask { continuation }
     }
 
     /// Add a dependency on another task, which is possibly running.
-    pub fn depend_on<C: AsRef<Mutex<Continuation>>>(&self, other: C) {
+    pub fn depend_on<C: AsRef<Mutex<Continuation>>>(&mut self, other: C) {
         match *other.as_ref().lock().unwrap() {
             Continuation::Playing { ref mut dependents } => {
-                dependents.push(Arc::clone(&self.task));
+                dependents.push(self.task.share());
             }
             Continuation::Done => {}
         }
