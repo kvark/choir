@@ -72,8 +72,8 @@ unsafe fn qsort(data: Array) {
             ptr: data.ptr.add(right_start),
             count: data.count - right_start,
         };
-        (*CHOIR).run_task(move || qsort(left));
-        (*CHOIR).run_task(move || qsort(right));
+        (*CHOIR).add_task(move || qsort(left));
+        (*CHOIR).add_task(move || qsort(right));
     } else if data.count > 1 {
         insertion_sort(slice::from_raw_parts_mut(data.ptr, data.count))
     }
@@ -98,7 +98,7 @@ fn main() {
         unsafe {
             CHOIR = &choir as *const _;
         }
-        choir.run_task(move || unsafe { qsort(data_raw) });
+        choir.add_task(move || unsafe { qsort(data_raw) });
         choir.wait_idle();
         unsafe {
             CHOIR = ptr::null();

@@ -33,10 +33,10 @@ jobs:
         with:
           command: test
       - uses: actions-rs/cargo@v1
-        name: Test all features
+        name: Test all
         with:
           command: test
-          args: --workspace --all-features
+          args: --workspace
       - uses: actions-rs/cargo@v1
         name: Build the bench
         with:
