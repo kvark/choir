@@ -30,6 +30,9 @@ Lifetime of a Task:
 )]
 //#![forbid(unsafe_code)]
 
+/// Additional utilities.
+pub mod util;
+
 use crossbeam_deque::{Injector, Steal};
 use std::{
     mem, ops,
