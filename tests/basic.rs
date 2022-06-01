@@ -16,11 +16,9 @@ fn parallel() {
     // the value. Expect all of them to work.
     for _ in 0..n {
         let v = Arc::clone(&value);
-        choir
-            .add_task(move || {
-                v.fetch_add(1, Ordering::AcqRel);
-            })
-            .run();
+        choir.add_task(move || {
+            v.fetch_add(1, Ordering::AcqRel);
+        });
     }
 
     choir.wait_idle();
@@ -47,7 +45,6 @@ fn sequential() {
             *v.lock().unwrap() = i + 1;
         });
         next.depend_on(&base);
-        base.run();
         base = next;
     }
     base.run();
@@ -65,11 +62,9 @@ fn multi_sum() {
     let value = Arc::new(AtomicUsize::new(0));
     let value_other = Arc::clone(&value);
     let n = 100;
-    choir
-        .add_multi_task(n, move |i| {
-            value_other.fetch_add(i as usize, Ordering::SeqCst);
-        })
-        .run();
+    choir.add_multi_task(n, move |i| {
+        value_other.fetch_add(i as usize, Ordering::SeqCst);
+    });
     choir.wait_idle();
     assert_eq!(value.load(Ordering::Acquire) as u32, (n - 1) * n / 2);
 }
@@ -85,11 +80,9 @@ fn iter_xor() {
     let value_other = Arc::clone(&value);
     let n = 50;
 
-    choir
-        .add_iter_task(0..n, move |item| {
-            value_other.fetch_xor(item, Ordering::SeqCst);
-        })
-        .run();
+    choir.add_iter_task(0..n, move |item| {
+        value_other.fetch_xor(item, Ordering::SeqCst);
+    });
     choir.wait_idle();
     assert_eq!(value.load(Ordering::Acquire), 1);
 }

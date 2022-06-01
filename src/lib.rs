@@ -18,7 +18,8 @@ Lifetime of a Task:
     clippy::match_like_matches_macro,
     clippy::manual_strip,
     clippy::if_same_then_else,
-    clippy::unknown_clippy_lints
+    clippy::unknown_clippy_lints,
+    clippy::len_without_is_empty
 )]
 #![warn(
     missing_docs,
@@ -260,6 +261,8 @@ enum MaybeArc<T> {
 }
 
 impl<T> MaybeArc<T> {
+    const NULL_ERROR: &'static str = "Value is gone!";
+
     fn new(value: T) -> Self {
         Self::Unique(value)
     }
@@ -268,7 +271,7 @@ impl<T> MaybeArc<T> {
         let arc = match mem::replace(self, Self::Null) {
             Self::Unique(value) => Arc::new(value),
             Self::Shared(arc) => arc,
-            Self::Null => unreachable!(),
+            Self::Null => panic!("{}", Self::NULL_ERROR),
         };
         *self = Self::Shared(Arc::clone(&arc));
         arc
@@ -278,12 +281,12 @@ impl<T> MaybeArc<T> {
         match *self {
             Self::Unique(ref value) => value,
             Self::Shared(ref arc) => arc,
-            Self::Null => unreachable!(),
+            Self::Null => panic!("{}", Self::NULL_ERROR),
         }
     }
 
-    fn extract(self) -> Option<T> {
-        match self {
+    fn extract(&mut self) -> Option<T> {
+        match mem::replace(self, Self::Null) {
             Self::Unique(value) => Some(value),
             _ => None,
         }
@@ -291,6 +294,7 @@ impl<T> MaybeArc<T> {
 }
 
 /// Task that is created but not running yet.
+/// It will be scheduled on `run()` or on drop.
 pub struct IdleTask {
     conductor: Arc<Conductor>,
     task: MaybeArc<Task>,
@@ -431,7 +435,7 @@ impl IdleTask {
     /// Schedule this task for running.
     ///
     /// It will only be executed once the dependencies are fulfilled.
-    pub fn run(self) -> RunningTask {
+    pub fn run(&mut self) -> RunningTask {
         let continuation = Arc::clone(&self.task.as_ref().continuation);
         if let Some(ready) = self.task.extract() {
             self.conductor.schedule(ready);
@@ -450,6 +454,10 @@ impl IdleTask {
     }
 }
 
-// Note: would be nice to log the dropping of `IdleTask`,
-// but currently unable to implement `drop` because it's getting
-// destructured in `IdleTask::run()`.
+impl Drop for IdleTask {
+    fn drop(&mut self) {
+        if let Some(ready) = self.task.extract() {
+            self.conductor.schedule(ready);
+        }
+    }
+}

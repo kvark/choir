@@ -11,6 +11,9 @@ unsafe impl<T> Sync for PerTaskData<T> {}
 
 impl<T> PerTaskData<T> {
     /// Take an element at a given index.
+    ///
+    /// # Safety
+    /// Can't be executed more than once for any given index.
     pub unsafe fn take(&self, index: SubIndex) -> T {
         (*self.data[index as usize].get()).take().unwrap()
     }
@@ -35,11 +38,9 @@ fn smoke() {
     let _worker1 = choir.add_worker("P1");
 
     let data: PerTaskData<u32> = (0..10).collect();
-    choir
-        .add_multi_task(data.len(), move |i| {
-            let v = unsafe { data.take(i) };
-            println!("v = {}", v);
-        })
-        .run();
+    choir.add_multi_task(data.len(), move |i| {
+        let v = unsafe { data.take(i) };
+        println!("v = {}", v);
+    });
     choir.wait_idle();
 }
