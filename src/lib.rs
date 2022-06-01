@@ -393,6 +393,20 @@ impl Choir {
         }
     }
 
+    /// Create a mukti-task without dependencies and run it instantly.
+    #[profiling::function]
+    pub fn run_iter_task<I, F>(&self, iter: I, fun: F) -> RunningTask
+    where
+        I: Iterator,
+        I::Item: Send + 'static,
+        F: Fn(I::Item) + Send + Sync + 'static,
+    {
+        let task_data = iter.collect::<util::PerTaskData<_>>();
+        self.run_multi_task(task_data.len(), move |index| unsafe {
+            fun(task_data.take(index))
+        })
+    }
+
     /// Block until the running queue is empty.
     #[profiling::function]
     pub fn wait_idle(&self) {

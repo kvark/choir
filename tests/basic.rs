@@ -69,3 +69,21 @@ fn multi_sum() {
     choir.wait_idle();
     assert_eq!(value.load(Ordering::Acquire) as u32, (n - 1) * n / 2);
 }
+
+#[test]
+fn iter_xor() {
+    let _ = env_logger::try_init();
+    let mut choir = choir::Choir::new();
+    let _worker1 = choir.add_worker("A");
+    let _worker2 = choir.add_worker("B");
+
+    let value = Arc::new(AtomicUsize::new(0));
+    let value_other = Arc::clone(&value);
+    let n = 50;
+
+    choir.run_iter_task(0..n, move |item| {
+        value_other.fetch_xor(item, Ordering::SeqCst);
+    });
+    choir.wait_idle();
+    assert_eq!(value.load(Ordering::Acquire), 1);
+}
