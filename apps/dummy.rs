@@ -4,7 +4,7 @@ fn main() {
         .map(|i| choir.add_worker(&format!("worker-{}", i)))
         .collect::<Vec<_>>();
     for _ in 0..1_000_000 {
-        choir.run_task(|| {});
+        choir.add_task(|| {});
     }
     choir.wait_idle();
 }

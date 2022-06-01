@@ -12,8 +12,8 @@ Choir is a task orchestration framework. It helps you to organize all the CPU wo
 ```rust
 let choir = choir::Choir::new();
 let _worker = choir.add_worker("worker");
-let task1 = choir.run_task(|| { println!("foo"); });
-let task2 = choir.idle_task(|| { println!("bar"); });
+let task1 = choir.add_task(|| { println!("foo"); });
+let task2 = choir.add_task(|| { println!("bar"); });
 task2.depend_on(&task1);
 task2.run();
 ```
@@ -40,8 +40,7 @@ In addition, Choir supports multi-tasks, which execute the selected number of ti
 
 Machine: MBP 2016, 3.3 GHz Dual-Core Intel Core i7
 
-- function `run_task` (optimized): 237ns
-- function `run_task` (fallback): 401ns
+- function `add_task` (optimized): 237ns
 - "steal" task: 61ns
 - empty "execute": 37ns
 - dummy "unblock": 78ns
