@@ -435,12 +435,11 @@ impl IdleTask {
     /// Schedule this task for running.
     ///
     /// It will only be executed once the dependencies are fulfilled.
-    pub fn run(&mut self) -> RunningTask {
-        let continuation = Arc::clone(&self.task.as_ref().continuation);
-        if let Some(ready) = self.task.extract() {
-            self.conductor.schedule(ready);
+    pub fn run(self) -> RunningTask {
+        let task = self.task.as_ref();
+        RunningTask {
+            continuation: Arc::clone(&task.continuation),
         }
-        RunningTask { continuation }
     }
 
     /// Add a dependency on another task, which is possibly running.
