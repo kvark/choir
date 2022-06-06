@@ -35,13 +35,16 @@ Lifetime of a Task:
 pub mod util;
 
 use crossbeam_deque::{Injector, Steal};
-use std::{
-    mem, ops,
-    sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc, Mutex, RwLock,
-    },
-    thread,
+use std::{mem, ops};
+
+#[cfg(feature = "loom")]
+use loom::{sync, thread};
+#[cfg(not(feature = "loom"))]
+use std::{sync, thread};
+
+use self::sync::{
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    Arc, Mutex, RwLock,
 };
 
 const MAX_WORKERS: usize = mem::size_of::<usize>() * 8;
@@ -66,6 +69,18 @@ enum Functor {
 // This is totally safe. See:
 // https://internals.rust-lang.org/t/dyn-fnonce-should-always-be-sync/16470
 unsafe impl Sync for Functor {}
+
+// See https://github.com/tokio-rs/loom/issues/259
+impl Functor {
+    #[cfg(feature = "loom")]
+    fn from_multi(count: SubIndex, fun: impl Fn(SubIndex) + Send + Sync + 'static) -> Self {
+        Self::Multi(0..count, Arc::from_std(std::sync::Arc::from(fun)))
+    }
+    #[cfg(not(feature = "loom"))]
+    fn from_multi(count: SubIndex, fun: impl Fn(SubIndex) + Send + Sync + 'static) -> Self {
+        Self::Multi(0..count, Arc::new(fun))
+    }
+}
 
 #[doc(hidden)]
 pub struct Task {
@@ -96,6 +111,7 @@ struct Conductor {
 
 impl Conductor {
     fn is_busy(&self) -> bool {
+        profiling::scope!("is busy");
         if self.injector.is_empty() {
             let pool = self.workers.read().unwrap();
             let workers_mask = pool.contexts.iter().rev().fold(0usize, |mask, w| {
@@ -143,6 +159,7 @@ impl Conductor {
                 if middle != sub_range.start {
                     let mask = self.parked_mask.load(Ordering::Acquire);
                     if mask != 0 {
+                        profiling::scope!("branch");
                         self.injector.push(Task {
                             id: task.id,
                             functor: Functor::Multi(middle..sub_range.end, Arc::clone(&fun)),
@@ -163,7 +180,10 @@ impl Conductor {
                     }
                 }
                 // fun the functor
-                (fun)(sub_range.start);
+                {
+                    profiling::scope!("execute");
+                    (fun)(sub_range.start);
+                }
                 // are we done yet?
                 sub_range.start += 1;
                 if sub_range.start == sub_range.end {
@@ -389,7 +409,7 @@ impl Choir {
         fun: impl Fn(SubIndex) + Send + Sync + 'static,
     ) -> IdleTask {
         assert_ne!(count, 0);
-        let task = self.create_task(Functor::Multi(0..count, Arc::new(fun)));
+        let task = self.create_task(Functor::from_multi(count, fun));
         log::trace!("\twith {} instances", count);
         IdleTask {
             conductor: Arc::clone(&self.conductor),
@@ -414,6 +434,7 @@ impl Choir {
     /// Block until the running queue is empty.
     #[profiling::function]
     pub fn wait_idle(&self) {
+        profiling::scope!("wait idle");
         assert_eq!(thread::current().id(), self.conductor.main_thread.id());
         while self.conductor.is_busy() {
             // will be woken up by workers finishing

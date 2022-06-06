@@ -21,6 +21,8 @@ harness = false
 [dependencies]
 crossbeam-deque = "0.8"
 log = "0.4"
+#loom = { git = "https://github.com/tokio-rs/loom", rev="d0c1e7108a0f8e0a397f3ad32a7e7e650b2db71e", optional = true }
+loom = { path = "../loom", features = ["checkpoint"], optional = true }
 profiling = "1"
 
 [dev-dependencies]
