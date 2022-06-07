@@ -53,6 +53,14 @@ fn sequential() {
 }
 
 #[test]
+fn zero_count() {
+    let mut choir = choir::Choir::new();
+    let _worker1 = choir.add_worker("A");
+    choir.add_multi_task(0, |_| {});
+    choir.wait_idle();
+}
+
+#[test]
 fn multi_sum() {
     let _ = env_logger::try_init();
     let mut choir = choir::Choir::new();
