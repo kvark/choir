@@ -377,6 +377,8 @@ impl Choir {
     }
 
     /// Add a simple task.
+    /// The function body will be executed once the task is scheduled,
+    /// and all of its dependencies are fulfulled.
     #[profiling::function]
     pub fn add_task(&self, fun: impl FnOnce() + Send + 'static) -> IdleTask {
         let task = self.create_task(Functor::Single(Box::new(fun)));
@@ -386,7 +388,22 @@ impl Choir {
         }
     }
 
+    /// Add a task without a body.
+    /// Can be useful to aggregate dependencies, for example
+    /// if a function returns a task handle, and it launches
+    /// multiple sub-tasks in parallel.
+    #[profiling::function]
+    pub fn add_dummy_task(&self) -> IdleTask {
+        let task = self.create_task(Functor::Dummy);
+        IdleTask {
+            conductor: Arc::clone(&self.conductor),
+            task: MaybeArc::new(task),
+        }
+    }
+
     /// Add a task that's executed multiple times.
+    /// Every invocation is given an index in 0..count
+    /// There are no ordering guarantees between the indices.
     #[profiling::function]
     pub fn add_multi_task(
         &self,
@@ -406,6 +423,8 @@ impl Choir {
     }
 
     /// Add a task that's executed on a finite iterator of values.
+    /// Similarly to `add_multi_task`, each invocation is executed
+    /// indepdently and can be out of order.
     #[profiling::function]
     pub fn add_iter_task<I, F>(&self, iter: I, fun: F) -> IdleTask
     where

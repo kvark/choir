@@ -1,5 +1,8 @@
 # Change Log
 
+## v0.4.2 (07-06-2022)
+  - dummy tasks support
+
 ## v0.4 (01-06-2022)
   - iterator tasks support
   - auto-schedule idle tasks on drop
