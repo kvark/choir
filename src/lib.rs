@@ -56,6 +56,7 @@ pub enum Continuation {
 pub type SubIndex = u32;
 
 enum Functor {
+    Dummy,
     Single(Box<dyn FnOnce() + Send + 'static>),
     Multi(
         ops::Range<SubIndex>,
@@ -124,6 +125,10 @@ impl Conductor {
 
     fn execute(&self, task: Task, worker_index: usize) -> Option<Arc<Mutex<Continuation>>> {
         match task.functor {
+            Functor::Dummy => {
+                log::debug!("Task {} (dummy) runs on thread[{}]", task.id, worker_index);
+                Some(task.continuation)
+            }
             Functor::Single(fun) => {
                 log::debug!("Task {} runs on thread[{}]", task.id, worker_index);
                 profiling::scope!("execute");
@@ -132,7 +137,7 @@ impl Conductor {
             }
             Functor::Multi(mut sub_range, mut fun) => {
                 log::debug!(
-                    "Task {} {{{}}} runs on thread[{}]",
+                    "Task {} ({}) runs on thread[{}]",
                     task.id,
                     sub_range.start,
                     worker_index,
@@ -388,8 +393,11 @@ impl Choir {
         count: SubIndex,
         fun: impl Fn(SubIndex) + Send + Sync + 'static,
     ) -> IdleTask {
-        assert_ne!(count, 0);
-        let task = self.create_task(Functor::Multi(0..count, Arc::new(fun)));
+        let task = self.create_task(if count == 0 {
+            Functor::Dummy
+        } else {
+            Functor::Multi(0..count, Arc::new(fun))
+        });
         log::trace!("\twith {} instances", count);
         IdleTask {
             conductor: Arc::clone(&self.conductor),
