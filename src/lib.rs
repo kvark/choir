@@ -34,11 +34,11 @@ Lifetime of a Task:
 /// Additional utilities.
 pub mod util;
 
-use crossbeam_deque::{Injector, Steal};
+use synqueue::{AxelQueue, SynQueue};
 use std::{mem, ops};
 
 #[cfg(feature = "loom")]
-use loom::{sync, thread};
+use loom_crate::{sync, thread};
 #[cfg(not(feature = "loom"))]
 use std::{sync, thread};
 
@@ -103,7 +103,7 @@ struct WorkerPool {
 }
 
 struct Conductor {
-    injector: Injector<Task>,
+    injector: AxelQueue<Task>,
     workers: RwLock<WorkerPool>,
     parked_mask: AtomicUsize,
     main_thread: thread::Thread,
@@ -232,8 +232,8 @@ impl Conductor {
         log::info!("Thread[{}] = '{}' started", index, worker.name);
 
         while worker.alive.load(Ordering::Acquire) {
-            match self.injector.steal() {
-                Steal::Empty => {
+            match self.injector.pop() {
+                None => {
                     log::trace!("Thread[{}] sleeps", index);
                     let mask = 1 << index;
                     self.parked_mask.fetch_or(mask, Ordering::AcqRel);
@@ -248,12 +248,11 @@ impl Conductor {
                     }
                     self.parked_mask.fetch_and(!mask, Ordering::AcqRel);
                 }
-                Steal::Success(task) => {
+                Some(task) => {
                     if let Some(continuation) = self.execute(task, index) {
                         self.finish(&mut *continuation.lock().unwrap());
                     }
                 }
-                Steal::Retry => {}
             }
         }
 
@@ -341,7 +340,7 @@ impl Choir {
     /// Create a new task system.
     pub fn new() -> Self {
         const NO_WORKER: Option<WorkerContext> = None;
-        let injector = Injector::new();
+        let injector = AxelQueue::new(100000);
         Self {
             conductor: Arc::new(Conductor {
                 injector,

@@ -1,6 +1,6 @@
 use super::SubIndex;
 #[cfg(feature = "loom")]
-use loom::cell::UnsafeCell;
+use loom_crate::cell::UnsafeCell;
 #[cfg(not(feature = "loom"))]
 use std::cell::UnsafeCell;
 use std::iter::FromIterator;
@@ -60,5 +60,5 @@ fn smoke() {
 #[cfg(feature = "loom")]
 #[test]
 fn loom() {
-    loom::model(smoke);
+    loom_crate::model(smoke);
 }

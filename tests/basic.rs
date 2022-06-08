@@ -1,5 +1,5 @@
 #[cfg(feature = "loom")]
-use loom::sync;
+use loom_crate::sync;
 #[cfg(not(feature = "loom"))]
 use std::sync;
 
@@ -12,9 +12,9 @@ use self::sync::{
 #[test]
 fn loom() {
     //loom::model(parallel);
-    loom::model(sequential);
+    loom_crate::model(sequential);
     //loom::model(multi_sum);
-    loom::model(iter_xor);
+    loom_crate::model(iter_xor);
 }
 
 #[cfg_attr(not(feature = "loom"), test)]
