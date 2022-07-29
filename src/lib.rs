@@ -62,10 +62,10 @@ pub type SubIndex = u32;
 
 enum Functor {
     Dummy,
-    Single(Box<dyn FnOnce(&Notifier) + Send + 'static>),
+    Single(Box<dyn FnOnce(&Arc<Notifier>) + Send + 'static>),
     Multi(
         ops::Range<SubIndex>,
-        Arc<dyn Fn(&Notifier, SubIndex) + Send + Sync + 'static>,
+        Arc<dyn Fn(&Arc<Notifier>, SubIndex) + Send + Sync + 'static>,
     ),
 }
 
@@ -302,6 +302,15 @@ impl<T> MaybeArc<T> {
     }
 }
 
+/// Task construct without any functional logic.
+pub struct ProtoTask<'c> {
+    id: usize,
+    #[allow(unused)]
+    name: String,
+    conductor: &'c Arc<Conductor>,
+    notifier: Arc<Notifier>,
+}
+
 /// Task that is created but not running yet.
 /// It will be scheduled on `run()` or on drop.
 pub struct IdleTask {
@@ -312,6 +321,64 @@ pub struct IdleTask {
 impl AsRef<Notifier> for IdleTask {
     fn as_ref(&self) -> &Notifier {
         &self.task.as_ref().notifier
+    }
+}
+
+impl ProtoTask<'_> {
+    fn fill(self, functor: Functor) -> IdleTask {
+        IdleTask {
+            conductor: Arc::clone(self.conductor),
+            task: MaybeArc::new(Task {
+                id: self.id,
+                functor,
+                notifier: self.notifier,
+            }),
+        }
+    }
+
+    /// Init task with no function.
+    /// Can be useful to aggregate dependencies, for example
+    /// if a function returns a task handle, and it launches
+    /// multiple sub-tasks in parallel.
+    pub fn init_dummy(self) -> IdleTask {
+        self.fill(Functor::Dummy)
+    }
+
+    /// Init task to execute a standalone function.
+    /// The function body will be executed once the task is scheduled,
+    /// and all of its dependencies are fulfulled.
+    pub fn init<F: FnOnce(&Arc<Notifier>) + Send + 'static>(self, fun: F) -> IdleTask {
+        self.fill(Functor::Single(Box::new(fun)))
+    }
+
+    /// Init task to execute a function multiple times.
+    /// Every invocation is given an index in 0..count
+    /// There are no ordering guarantees between the indices.
+    pub fn init_multi<F: Fn(&Arc<Notifier>, SubIndex) + Send + Sync + 'static>(
+        self,
+        count: SubIndex,
+        fun: F,
+    ) -> IdleTask {
+        self.fill(if count == 0 {
+            Functor::Dummy
+        } else {
+            Functor::Multi(0..count, Arc::new(fun))
+        })
+    }
+
+    /// Init task to execute a function on each element of a finite iterator.
+    /// Similarly to `init_multi`, each invocation is executed
+    /// indepdently and can be out of order.
+    pub fn init_iter<I, F>(self, iter: I, fun: F) -> IdleTask
+    where
+        I: Iterator,
+        I::Item: Send + 'static,
+        F: Fn(I::Item) + Send + Sync + 'static,
+    {
+        let task_data = iter.collect::<util::PerTaskData<_>>();
+        self.init_multi(task_data.len(), move |_, index| unsafe {
+            fun(task_data.take(index))
+        })
     }
 }
 
@@ -367,81 +434,37 @@ impl Choir {
         }
     }
 
-    /// Internal method to create task data.
-    fn create_task(&self, functor: Functor) -> Task {
+    fn spawn_with_notifier(&self, name: &str, notifier: Arc<Notifier>) -> ProtoTask {
         let id = self.next_id.fetch_add(1, Ordering::AcqRel);
         log::trace!("Creating task {}", id);
-        Task {
+        ProtoTask {
             id,
-            functor,
-            notifier: Arc::new(Notifier {
+            name: name.to_string(),
+            conductor: &self.conductor,
+            notifier,
+        }
+    }
+
+    /// Spawn a new task.
+    #[profiling::function]
+    pub fn spawn(&self, name: &str) -> ProtoTask {
+        self.spawn_with_notifier(
+            name,
+            Arc::new(Notifier {
                 continuation: Mutex::new(Continuation::Playing {
                     dependents: Vec::new(),
                 }),
             }),
-        }
+        )
     }
 
-    /// Add a simple task.
-    /// The function body will be executed once the task is scheduled,
-    /// and all of its dependencies are fulfulled.
-    #[profiling::function]
-    pub fn add_task(&self, fun: impl FnOnce(&Notifier) + Send + 'static) -> IdleTask {
-        let task = self.create_task(Functor::Single(Box::new(fun)));
-        IdleTask {
-            conductor: Arc::clone(&self.conductor),
-            task: MaybeArc::new(task),
-        }
-    }
-
-    /// Add a task without a body.
-    /// Can be useful to aggregate dependencies, for example
-    /// if a function returns a task handle, and it launches
-    /// multiple sub-tasks in parallel.
-    #[profiling::function]
-    pub fn add_dummy_task(&self) -> IdleTask {
-        let task = self.create_task(Functor::Dummy);
-        IdleTask {
-            conductor: Arc::clone(&self.conductor),
-            task: MaybeArc::new(task),
-        }
-    }
-
-    /// Add a task that's executed multiple times.
-    /// Every invocation is given an index in 0..count
-    /// There are no ordering guarantees between the indices.
-    #[profiling::function]
-    pub fn add_multi_task(
-        &self,
-        count: SubIndex,
-        fun: impl Fn(&Notifier, SubIndex) + Send + Sync + 'static,
-    ) -> IdleTask {
-        let task = self.create_task(if count == 0 {
-            Functor::Dummy
-        } else {
-            Functor::Multi(0..count, Arc::new(fun))
-        });
-        log::trace!("\twith {} instances", count);
-        IdleTask {
-            conductor: Arc::clone(&self.conductor),
-            task: MaybeArc::new(task),
-        }
-    }
-
-    /// Add a task that's executed on a finite iterator of values.
-    /// Similarly to `add_multi_task`, each invocation is executed
-    /// indepdently and can be out of order.
-    #[profiling::function]
-    pub fn add_iter_task<I, F>(&self, iter: I, fun: F) -> IdleTask
-    where
-        I: Iterator,
-        I::Item: Send + 'static,
-        F: Fn(I::Item) + Send + Sync + 'static,
-    {
-        let task_data = iter.collect::<util::PerTaskData<_>>();
-        self.add_multi_task(task_data.len(), move |_, index| unsafe {
-            fun(task_data.take(index))
-        })
+    /// Spawn a task that shares a given notifier.
+    ///
+    /// This is useful because it allows creating tasks on the fly from within
+    /// other tasks. Generally, making a task in flight depend on anything is impossible.
+    /// But one can create a proxy task from a dependency
+    pub fn spawn_proxy(&self, name: &str, notifier: &Arc<Notifier>) -> ProtoTask {
+        self.spawn_with_notifier(name, Arc::clone(notifier))
     }
 
     /// Block until the running queue is empty.
