@@ -44,12 +44,17 @@ use std::{
     thread,
 };
 
-const MAX_WORKERS: usize = mem::size_of::<usize>() * 8;
+const BITS_PER_BYTE: usize = 8;
+const MAX_WORKERS: usize = mem::size_of::<usize>() * BITS_PER_BYTE;
 
-#[doc(hidden)]
-pub enum Continuation {
+enum Continuation {
     Playing { dependents: Vec<Arc<Task>> },
     Done,
+}
+
+/// An object responsible to notify follow-up tasks.
+pub struct Notifier {
+    continuation: Mutex<Continuation>,
 }
 
 /// Index of a sub-task inside a multi-task.
@@ -68,11 +73,10 @@ enum Functor {
 // https://internals.rust-lang.org/t/dyn-fnonce-should-always-be-sync/16470
 unsafe impl Sync for Functor {}
 
-#[doc(hidden)]
-pub struct Task {
+struct Task {
     id: usize,
     functor: Functor,
-    continuation: Arc<Mutex<Continuation>>,
+    notifier: Arc<Notifier>,
 }
 
 struct Worker {
@@ -123,17 +127,17 @@ impl Conductor {
         }
     }
 
-    fn execute(&self, task: Task, worker_index: usize) -> Option<Arc<Mutex<Continuation>>> {
+    fn execute(&self, task: Task, worker_index: usize) -> Option<Arc<Notifier>> {
         match task.functor {
             Functor::Dummy => {
                 log::debug!("Task {} (dummy) runs on thread[{}]", task.id, worker_index);
-                Some(task.continuation)
+                Some(task.notifier)
             }
             Functor::Single(fun) => {
                 log::debug!("Task {} runs on thread[{}]", task.id, worker_index);
                 profiling::scope!("execute");
                 (fun)();
-                Some(task.continuation)
+                Some(task.notifier)
             }
             Functor::Multi(mut sub_range, mut fun) => {
                 log::debug!(
@@ -151,7 +155,7 @@ impl Conductor {
                         self.injector.push(Task {
                             id: task.id,
                             functor: Functor::Multi(middle..sub_range.end, Arc::clone(&fun)),
-                            continuation: Arc::clone(&task.continuation),
+                            notifier: Arc::clone(&task.notifier),
                         });
                         let index = mask.trailing_zeros() as usize;
                         log::trace!(
@@ -172,8 +176,8 @@ impl Conductor {
                 // are we done yet?
                 sub_range.start += 1;
                 if sub_range.start == sub_range.end {
-                    // return the continuation if this is the last task in the set
-                    Arc::get_mut(&mut fun).map(|_| task.continuation)
+                    // return the notifier if this is the last task in the set
+                    Arc::get_mut(&mut fun).map(|_| task.notifier)
                 } else {
                     // Put it back to the queue, with the next sub-index.
                     // Note: we aren't calling `schedule` because we know at least this very thread
@@ -181,7 +185,7 @@ impl Conductor {
                     self.injector.push(Task {
                         id: task.id,
                         functor: Functor::Multi(sub_range, fun),
-                        continuation: task.continuation,
+                        notifier: task.notifier,
                     });
                     None
                 }
@@ -234,8 +238,8 @@ impl Conductor {
                     self.parked_mask.fetch_and(!mask, Ordering::AcqRel);
                 }
                 Steal::Success(task) => {
-                    if let Some(continuation) = self.execute(task, index) {
-                        self.finish(&mut *continuation.lock().unwrap());
+                    if let Some(notifier) = self.execute(task, index) {
+                        self.finish(&mut *notifier.continuation.lock().unwrap());
                     }
                 }
                 Steal::Retry => {}
@@ -305,20 +309,20 @@ pub struct IdleTask {
     task: MaybeArc<Task>,
 }
 
-impl AsRef<Mutex<Continuation>> for IdleTask {
-    fn as_ref(&self) -> &Mutex<Continuation> {
-        &self.task.as_ref().continuation
+impl AsRef<Notifier> for IdleTask {
+    fn as_ref(&self) -> &Notifier {
+        &self.task.as_ref().notifier
     }
 }
 
 /// Task that is already scheduled for running.
 pub struct RunningTask {
-    continuation: Arc<Mutex<Continuation>>,
+    notifier: Arc<Notifier>,
 }
 
-impl AsRef<Mutex<Continuation>> for RunningTask {
-    fn as_ref(&self) -> &Mutex<Continuation> {
-        &self.continuation
+impl AsRef<Notifier> for RunningTask {
+    fn as_ref(&self) -> &Notifier {
+        &self.notifier
     }
 }
 
@@ -370,9 +374,11 @@ impl Choir {
         Task {
             id,
             functor,
-            continuation: Arc::new(Mutex::new(Continuation::Playing {
-                dependents: Vec::new(),
-            })),
+            notifier: Arc::new(Notifier {
+                continuation: Mutex::new(Continuation::Playing {
+                    dependents: Vec::new(),
+                }),
+            }),
         }
     }
 
@@ -465,13 +471,13 @@ impl IdleTask {
     pub fn run(self) -> RunningTask {
         let task = self.task.as_ref();
         RunningTask {
-            continuation: Arc::clone(&task.continuation),
+            notifier: Arc::clone(&task.notifier),
         }
     }
 
     /// Add a dependency on another task, which is possibly running.
-    pub fn depend_on<C: AsRef<Mutex<Continuation>>>(&mut self, other: C) {
-        match *other.as_ref().lock().unwrap() {
+    pub fn depend_on<N: AsRef<Notifier>>(&mut self, other: N) {
+        match *other.as_ref().continuation.lock().unwrap() {
             Continuation::Playing { ref mut dependents } => {
                 dependents.push(self.task.share());
             }
