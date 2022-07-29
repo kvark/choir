@@ -38,7 +38,7 @@ fn smoke() {
     let _worker1 = choir.add_worker("P1");
 
     let data: PerTaskData<u32> = (0..10).collect();
-    choir.add_multi_task(data.len(), move |i| {
+    choir.add_multi_task(data.len(), move |_, i| {
         let v = unsafe { data.take(i) };
         println!("v = {}", v);
     });

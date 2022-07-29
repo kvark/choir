@@ -62,10 +62,10 @@ pub type SubIndex = u32;
 
 enum Functor {
     Dummy,
-    Single(Box<dyn FnOnce() + Send + 'static>),
+    Single(Box<dyn FnOnce(&Notifier) + Send + 'static>),
     Multi(
         ops::Range<SubIndex>,
-        Arc<dyn Fn(SubIndex) + Send + Sync + 'static>,
+        Arc<dyn Fn(&Notifier, SubIndex) + Send + Sync + 'static>,
     ),
 }
 
@@ -136,7 +136,7 @@ impl Conductor {
             Functor::Single(fun) => {
                 log::debug!("Task {} runs on thread[{}]", task.id, worker_index);
                 profiling::scope!("execute");
-                (fun)();
+                (fun)(&task.notifier);
                 Some(task.notifier)
             }
             Functor::Multi(mut sub_range, mut fun) => {
@@ -172,7 +172,7 @@ impl Conductor {
                     }
                 }
                 // fun the functor
-                (fun)(sub_range.start);
+                (fun)(&task.notifier, sub_range.start);
                 // are we done yet?
                 sub_range.start += 1;
                 if sub_range.start == sub_range.end {
@@ -386,7 +386,7 @@ impl Choir {
     /// The function body will be executed once the task is scheduled,
     /// and all of its dependencies are fulfulled.
     #[profiling::function]
-    pub fn add_task(&self, fun: impl FnOnce() + Send + 'static) -> IdleTask {
+    pub fn add_task(&self, fun: impl FnOnce(&Notifier) + Send + 'static) -> IdleTask {
         let task = self.create_task(Functor::Single(Box::new(fun)));
         IdleTask {
             conductor: Arc::clone(&self.conductor),
@@ -414,7 +414,7 @@ impl Choir {
     pub fn add_multi_task(
         &self,
         count: SubIndex,
-        fun: impl Fn(SubIndex) + Send + Sync + 'static,
+        fun: impl Fn(&Notifier, SubIndex) + Send + Sync + 'static,
     ) -> IdleTask {
         let task = self.create_task(if count == 0 {
             Functor::Dummy
@@ -439,7 +439,7 @@ impl Choir {
         F: Fn(I::Item) + Send + Sync + 'static,
     {
         let task_data = iter.collect::<util::PerTaskData<_>>();
-        self.add_multi_task(task_data.len(), move |index| unsafe {
+        self.add_multi_task(task_data.len(), move |_, index| unsafe {
             fun(task_data.take(index))
         })
     }
