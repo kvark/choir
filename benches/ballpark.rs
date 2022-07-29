@@ -7,7 +7,7 @@ fn many_tasks(c: &mut Criterion) {
         let _worker = choir.add_worker("main");
         b.iter(|| {
             for _ in 0..TASK_COUNT {
-                choir.add_task(|| {});
+                choir.spawn("").init(|_| {});
             }
             choir.wait_idle();
         });
@@ -20,7 +20,7 @@ fn many_tasks(c: &mut Criterion) {
             .collect::<Vec<_>>();
         b.iter(|| {
             for _ in 0..TASK_COUNT {
-                choir.add_task(|| {});
+                choir.spawn("").init(|_| {});
             }
             choir.wait_idle();
         });
@@ -29,7 +29,7 @@ fn many_tasks(c: &mut Criterion) {
         let mut choir = choir::Choir::new();
         let _worker = choir.add_worker("main");
         b.iter(|| {
-            choir.add_multi_task(TASK_COUNT, |_| {});
+            choir.spawn("").init_multi(TASK_COUNT, |_, _| {});
             choir.wait_idle();
         });
     });
@@ -39,7 +39,7 @@ fn many_tasks(c: &mut Criterion) {
             .map(|i| choir.add_worker(&format!("worker-{}", i)))
             .collect::<Vec<_>>();
         b.iter(|| {
-            choir.add_multi_task(TASK_COUNT, |_| {});
+            choir.spawn("").init_multi(TASK_COUNT, |_, _| {});
             choir.wait_idle();
         });
     });
