@@ -16,7 +16,7 @@ fn parallel() {
     // the value. Expect all of them to work.
     for _ in 0..n {
         let v = Arc::clone(&value);
-        choir.add_task(move || {
+        choir.add_task(move |_| {
             v.fetch_add(1, Ordering::AcqRel);
         });
     }
@@ -32,7 +32,7 @@ fn sequential() {
     let _worker = choir.add_worker("S");
 
     let value = Arc::new(Mutex::new(0));
-    let mut base = choir.add_task(move || {});
+    let mut base = choir.add_task(move |_| {});
     let n = 100;
     // Launch N tasks, each depending on the previous one
     // and each setting a value.
@@ -41,7 +41,7 @@ fn sequential() {
     // it has to be N.
     for i in 0..n {
         let v = Arc::clone(&value);
-        let mut next = choir.add_task(move || {
+        let mut next = choir.add_task(move |_| {
             *v.lock().unwrap() = i + 1;
         });
         next.depend_on(&base);
@@ -56,7 +56,7 @@ fn sequential() {
 fn zero_count() {
     let mut choir = choir::Choir::new();
     let _worker1 = choir.add_worker("A");
-    choir.add_multi_task(0, |_| {});
+    choir.add_multi_task(0, |_, _| {});
     choir.wait_idle();
 }
 
@@ -70,7 +70,7 @@ fn multi_sum() {
     let value = Arc::new(AtomicUsize::new(0));
     let value_other = Arc::clone(&value);
     let n = 100;
-    choir.add_multi_task(n, move |i| {
+    choir.add_multi_task(n, move |_, i| {
         value_other.fetch_add(i as usize, Ordering::SeqCst);
     });
     choir.wait_idle();

@@ -12,8 +12,8 @@ Choir is a task orchestration framework. It helps you to organize all the CPU wo
 ```rust
 let choir = choir::Choir::new();
 let _worker = choir.add_worker("worker");
-let task1 = choir.add_task(|| { println!("foo"); });
-let task2 = choir.add_task(|| { println!("bar"); });
+let task1 = choir.add_task(|_| { println!("foo"); });
+let task2 = choir.add_task(|_| { println!("bar"); });
 task2.depend_on(&task1);
 task2.run();
 ```
