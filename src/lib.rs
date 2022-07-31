@@ -60,6 +60,20 @@ pub struct Notifier {
     continuation: Mutex<Continuation>,
 }
 
+impl Notifier {
+    fn block(&self, task: Arc<Task>) {
+        match *self.continuation.lock().unwrap() {
+            Continuation::Playing {
+                ref mut dependents,
+                waiting_threads: _,
+            } => {
+                dependents.push(task);
+            }
+            Continuation::Done => {}
+        }
+    }
+}
+
 /// Index of a sub-task inside a multi-task.
 pub type SubIndex = u32;
 
@@ -306,7 +320,7 @@ pub struct ProtoTask<'c> {
     #[allow(unused)]
     name: String,
     conductor: &'c Arc<Conductor>,
-    dependents: Vec<Arc<Task>>,
+    notifier: Notifier,
 }
 
 /// Task that is created but not running yet.
@@ -316,9 +330,21 @@ pub struct IdleTask {
     task: MaybeArc<Task>,
 }
 
-impl AsRef<Notifier> for IdleTask {
-    fn as_ref(&self) -> &Notifier {
-        &self.task.as_ref().notifier
+/// Ability to block a task that hasn't started yet.
+pub trait Dependency {
+    /// Prevent the specified task from running until self is done.
+    fn block(&self, idle: &mut IdleTask);
+}
+
+impl Dependency for ProtoTask<'_> {
+    fn block(&self, idle: &mut IdleTask) {
+        self.notifier.block(idle.task.share());
+    }
+}
+
+impl Dependency for IdleTask {
+    fn block(&self, idle: &mut IdleTask) {
+        self.task.as_ref().notifier.block(idle.task.share());
     }
 }
 
@@ -329,12 +355,7 @@ impl ProtoTask<'_> {
             task: MaybeArc::new(Task {
                 id: self.id,
                 functor,
-                notifier: Arc::new(Notifier {
-                    continuation: Mutex::new(Continuation::Playing {
-                        dependents: self.dependents,
-                        waiting_threads: Vec::new(),
-                    }),
-                }),
+                notifier: Arc::new(self.notifier),
             }),
         }
     }
@@ -390,9 +411,9 @@ pub struct RunningTask {
     notifier: Arc<Notifier>,
 }
 
-impl AsRef<Notifier> for RunningTask {
-    fn as_ref(&self) -> &Notifier {
-        &self.notifier
+impl Dependency for RunningTask {
+    fn block(&self, idle: &mut IdleTask) {
+        self.notifier.block(idle.task.share());
     }
 }
 
@@ -464,11 +485,17 @@ impl Choir {
     pub fn spawn(&self, name: &str) -> ProtoTask {
         let id = self.next_id.fetch_add(1, Ordering::AcqRel);
         log::trace!("Creating task {}", id);
+
         ProtoTask {
             id,
             name: name.to_string(),
             conductor: &self.conductor,
-            dependents: Vec::new(),
+            notifier: Notifier {
+                continuation: Mutex::new(Continuation::Playing {
+                    dependents: Vec::new(),
+                    waiting_threads: Vec::new(),
+                }),
+            },
         }
     }
 
@@ -478,17 +505,28 @@ impl Choir {
     /// other tasks. Generally, making a task in flight depend on anything is impossible.
     /// But one can create a proxy task from a dependency
     pub fn spawn_proxy(&self, name: &str, notifier: &Notifier) -> ProtoTask {
-        let mut proto = self.spawn(name);
-        match *notifier.continuation.lock().unwrap() {
+        let id = self.next_id.fetch_add(1, Ordering::AcqRel);
+        log::trace!("Creating proxy task {}", id);
+
+        let dependents = match *notifier.continuation.lock().unwrap() {
             Continuation::Playing {
                 ref dependents,
                 waiting_threads: _,
-            } => {
-                proto.dependents.extend_from_slice(dependents);
-            }
-            Continuation::Done => panic!("The notifier is already done"),
+            } => dependents.clone(),
+            Continuation::Done => unreachable!(),
+        };
+
+        ProtoTask {
+            id,
+            name: name.to_string(),
+            conductor: &self.conductor,
+            notifier: Notifier {
+                continuation: Mutex::new(Continuation::Playing {
+                    dependents,
+                    waiting_threads: Vec::new(),
+                }),
+            },
         }
-        proto
     }
 }
 
@@ -513,16 +551,8 @@ impl IdleTask {
     }
 
     /// Add a dependency on another task, which is possibly running.
-    pub fn depend_on<N: AsRef<Notifier>>(&mut self, other: N) {
-        match *other.as_ref().continuation.lock().unwrap() {
-            Continuation::Playing {
-                ref mut dependents,
-                waiting_threads: _,
-            } => {
-                dependents.push(self.task.share());
-            }
-            Continuation::Done => {}
-        }
+    pub fn depend_on<D: Dependency>(&mut self, dependency: &D) {
+        dependency.block(self);
     }
 }
 
