@@ -100,8 +100,9 @@ fn main() {
         }
         choir
             .spawn("main")
-            .init(move |_| unsafe { qsort(data_raw) });
-        choir.wait_idle();
+            .init(move |_| unsafe { qsort(data_raw) })
+            .run()
+            .join();
         unsafe {
             CHOIR = ptr::null();
         }
