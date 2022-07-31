@@ -14,14 +14,19 @@ fn parallel() {
     let n = 100;
     // Launch N independent tasks, each bumping
     // the value. Expect all of them to work.
+    let mut last = choir.spawn("last").init_dummy();
     for _ in 0..n {
         let v = Arc::clone(&value);
-        choir.spawn("").init(move |_| {
-            v.fetch_add(1, Ordering::AcqRel);
-        });
+        let child = choir
+            .spawn("")
+            .init(move |_| {
+                v.fetch_add(1, Ordering::AcqRel);
+            })
+            .run();
+        last.depend_on(&child);
     }
 
-    choir.wait_idle();
+    last.run().join();
     assert_eq!(value.load(Ordering::Acquire), n);
 }
 
@@ -32,7 +37,7 @@ fn sequential() {
     let _worker = choir.add_worker("S");
 
     let value = Arc::new(Mutex::new(0));
-    let mut base = choir.spawn("").init(move |_| {});
+    let mut base = choir.spawn("base").init_dummy();
     let n = 100;
     // Launch N tasks, each depending on the previous one
     // and each setting a value.
@@ -47,8 +52,7 @@ fn sequential() {
         next.depend_on(&base);
         base = next;
     }
-    base.run();
-    choir.wait_idle();
+    base.run().join();
     assert_eq!(*value.lock().unwrap(), n);
 }
 
@@ -56,8 +60,7 @@ fn sequential() {
 fn zero_count() {
     let mut choir = choir::Choir::new();
     let _worker1 = choir.add_worker("A");
-    choir.spawn("").init_multi(0, |_, _| {});
-    choir.wait_idle();
+    choir.spawn("").init_multi(0, |_, _| {}).run().join();
 }
 
 #[test]
@@ -70,10 +73,13 @@ fn multi_sum() {
     let value = Arc::new(AtomicUsize::new(0));
     let value_other = Arc::clone(&value);
     let n = 100;
-    choir.spawn("").init_multi(n, move |_, i| {
-        value_other.fetch_add(i as usize, Ordering::SeqCst);
-    });
-    choir.wait_idle();
+    choir
+        .spawn("")
+        .init_multi(n, move |_, i| {
+            value_other.fetch_add(i as usize, Ordering::SeqCst);
+        })
+        .run()
+        .join();
     assert_eq!(value.load(Ordering::Acquire) as u32, (n - 1) * n / 2);
 }
 
@@ -88,10 +94,13 @@ fn iter_xor() {
     let value_other = Arc::clone(&value);
     let n = 50;
 
-    choir.spawn("").init_iter(0..n, move |item| {
-        value_other.fetch_xor(item, Ordering::SeqCst);
-    });
-    choir.wait_idle();
+    choir
+        .spawn("")
+        .init_iter(0..n, move |item| {
+            value_other.fetch_xor(item, Ordering::SeqCst);
+        })
+        .run()
+        .join();
     assert_eq!(value.load(Ordering::Acquire), 1);
 }
 
@@ -108,17 +117,18 @@ fn proxy() {
     let value_other = Arc::clone(&value);
     let n = 50;
     let compute = choir_arc.spawn("parent").init_multi(n, move |notifier, i| {
+        println!("base[{}]", i);
         let value_other2 = Arc::clone(&value_other);
         value_other.fetch_or(1 << i, Ordering::SeqCst);
         choir_other.spawn_proxy("proxy", notifier).init(move |_| {
+            println!("proxy[{}]", i);
             value_other2.fetch_xor(1 << i, Ordering::SeqCst);
         });
     });
-    choir_arc
-        .spawn("test")
-        .init(move |_| {
-            assert_eq!(value.load(Ordering::Acquire), 0);
-        })
-        .depend_on(&compute);
-    choir_arc.wait_idle();
+    let mut test = choir_arc.spawn("test").init(move |_| {
+        assert_eq!(value.load(Ordering::Acquire), 0);
+    });
+    test.depend_on(&compute);
+    compute.run();
+    test.run().join();
 }

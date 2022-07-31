@@ -48,7 +48,10 @@ const BITS_PER_BYTE: usize = 8;
 const MAX_WORKERS: usize = mem::size_of::<usize>() * BITS_PER_BYTE;
 
 enum Continuation {
-    Playing { dependents: Vec<Arc<Task>> },
+    Playing {
+        dependents: Vec<Arc<Task>>,
+        waiting_threads: Vec<thread::Thread>,
+    },
     Done,
 }
 
@@ -62,10 +65,10 @@ pub type SubIndex = u32;
 
 enum Functor {
     Dummy,
-    Single(Box<dyn FnOnce(&Arc<Notifier>) + Send + 'static>),
+    Single(Box<dyn FnOnce(&Notifier) + Send + 'static>),
     Multi(
         ops::Range<SubIndex>,
-        Arc<dyn Fn(&Arc<Notifier>, SubIndex) + Send + Sync + 'static>,
+        Arc<dyn Fn(&Notifier, SubIndex) + Send + Sync + 'static>,
     ),
 }
 
@@ -76,6 +79,7 @@ unsafe impl Sync for Functor {}
 struct Task {
     id: usize,
     functor: Functor,
+    /// This notifier is only really shared with `RunningTask`
     notifier: Arc<Notifier>,
 }
 
@@ -96,22 +100,9 @@ struct Conductor {
     injector: Injector<Task>,
     workers: RwLock<WorkerPool>,
     parked_mask: AtomicUsize,
-    main_thread: thread::Thread,
 }
 
 impl Conductor {
-    fn is_busy(&self) -> bool {
-        if self.injector.is_empty() {
-            let pool = self.workers.read().unwrap();
-            let workers_mask = pool.contexts.iter().rev().fold(0usize, |mask, w| {
-                (mask << 1) | if w.is_some() { 1 } else { 0 }
-            });
-            workers_mask != self.parked_mask.load(Ordering::Acquire)
-        } else {
-            true
-        }
-    }
-
     fn schedule(&self, task: Task) {
         log::trace!("Task {} is scheduled", task.id);
         self.injector.push(task);
@@ -197,7 +188,15 @@ impl Conductor {
         profiling::scope!("unblock");
         // mark the task as done
         let dependents = match mem::replace(continuation, Continuation::Done) {
-            Continuation::Playing { dependents } => dependents,
+            Continuation::Playing {
+                dependents,
+                waiting_threads,
+            } => {
+                for thread in waiting_threads {
+                    thread.unpark();
+                }
+                dependents
+            }
             Continuation::Done => unreachable!(),
         };
         // unblock dependencies if needed
@@ -230,7 +229,6 @@ impl Conductor {
                     // and a new task is being scheduled at the same time.
                     if self.injector.is_empty() {
                         profiling::scope!("park");
-                        self.main_thread.unpark();
                         thread::park();
                     } else {
                         log::trace!("\tno, queue is not empty");
@@ -308,7 +306,7 @@ pub struct ProtoTask<'c> {
     #[allow(unused)]
     name: String,
     conductor: &'c Arc<Conductor>,
-    notifier: Arc<Notifier>,
+    dependents: Vec<Arc<Task>>,
 }
 
 /// Task that is created but not running yet.
@@ -331,7 +329,12 @@ impl ProtoTask<'_> {
             task: MaybeArc::new(Task {
                 id: self.id,
                 functor,
-                notifier: self.notifier,
+                notifier: Arc::new(Notifier {
+                    continuation: Mutex::new(Continuation::Playing {
+                        dependents: self.dependents,
+                        waiting_threads: Vec::new(),
+                    }),
+                }),
             }),
         }
     }
@@ -347,14 +350,14 @@ impl ProtoTask<'_> {
     /// Init task to execute a standalone function.
     /// The function body will be executed once the task is scheduled,
     /// and all of its dependencies are fulfulled.
-    pub fn init<F: FnOnce(&Arc<Notifier>) + Send + 'static>(self, fun: F) -> IdleTask {
+    pub fn init<F: FnOnce(&Notifier) + Send + 'static>(self, fun: F) -> IdleTask {
         self.fill(Functor::Single(Box::new(fun)))
     }
 
     /// Init task to execute a function multiple times.
     /// Every invocation is given an index in 0..count
     /// There are no ordering guarantees between the indices.
-    pub fn init_multi<F: Fn(&Arc<Notifier>, SubIndex) + Send + Sync + 'static>(
+    pub fn init_multi<F: Fn(&Notifier, SubIndex) + Send + Sync + 'static>(
         self,
         count: SubIndex,
         fun: F,
@@ -393,6 +396,29 @@ impl AsRef<Notifier> for RunningTask {
     }
 }
 
+impl RunningTask {
+    /// Block until the task has finished executing.
+    #[profiling::function]
+    pub fn join(self) {
+        match *self.notifier.continuation.lock().unwrap() {
+            Continuation::Playing {
+                dependents: _,
+                ref mut waiting_threads,
+            } => {
+                waiting_threads.push(thread::current());
+            }
+            Continuation::Done => return,
+        }
+        loop {
+            thread::park();
+            match *self.notifier.continuation.lock().unwrap() {
+                Continuation::Playing { .. } => (),
+                Continuation::Done => return,
+            }
+        }
+    }
+}
+
 impl Choir {
     /// Create a new task system.
     pub fn new() -> Self {
@@ -405,7 +431,6 @@ impl Choir {
                     contexts: [NO_WORKER; MAX_WORKERS],
                 }),
                 parked_mask: AtomicUsize::new(0),
-                main_thread: thread::current(),
             }),
             next_id: AtomicUsize::new(1),
         }
@@ -434,28 +459,17 @@ impl Choir {
         }
     }
 
-    fn spawn_with_notifier(&self, name: &str, notifier: Arc<Notifier>) -> ProtoTask {
+    /// Spawn a new task.
+    #[profiling::function]
+    pub fn spawn(&self, name: &str) -> ProtoTask {
         let id = self.next_id.fetch_add(1, Ordering::AcqRel);
         log::trace!("Creating task {}", id);
         ProtoTask {
             id,
             name: name.to_string(),
             conductor: &self.conductor,
-            notifier,
+            dependents: Vec::new(),
         }
-    }
-
-    /// Spawn a new task.
-    #[profiling::function]
-    pub fn spawn(&self, name: &str) -> ProtoTask {
-        self.spawn_with_notifier(
-            name,
-            Arc::new(Notifier {
-                continuation: Mutex::new(Continuation::Playing {
-                    dependents: Vec::new(),
-                }),
-            }),
-        )
     }
 
     /// Spawn a task that shares a given notifier.
@@ -463,18 +477,18 @@ impl Choir {
     /// This is useful because it allows creating tasks on the fly from within
     /// other tasks. Generally, making a task in flight depend on anything is impossible.
     /// But one can create a proxy task from a dependency
-    pub fn spawn_proxy(&self, name: &str, notifier: &Arc<Notifier>) -> ProtoTask {
-        self.spawn_with_notifier(name, Arc::clone(notifier))
-    }
-
-    /// Block until the running queue is empty.
-    #[profiling::function]
-    pub fn wait_idle(&self) {
-        assert_eq!(thread::current().id(), self.conductor.main_thread.id());
-        while self.conductor.is_busy() {
-            // will be woken up by workers finishing
-            thread::park();
+    pub fn spawn_proxy(&self, name: &str, notifier: &Notifier) -> ProtoTask {
+        let mut proto = self.spawn(name);
+        match *notifier.continuation.lock().unwrap() {
+            Continuation::Playing {
+                ref dependents,
+                waiting_threads: _,
+            } => {
+                proto.dependents.extend_from_slice(dependents);
+            }
+            Continuation::Done => panic!("The notifier is already done"),
         }
+        proto
     }
 }
 
@@ -501,7 +515,10 @@ impl IdleTask {
     /// Add a dependency on another task, which is possibly running.
     pub fn depend_on<N: AsRef<Notifier>>(&mut self, other: N) {
         match *other.as_ref().continuation.lock().unwrap() {
-            Continuation::Playing { ref mut dependents } => {
+            Continuation::Playing {
+                ref mut dependents,
+                waiting_threads: _,
+            } => {
                 dependents.push(self.task.share());
             }
             Continuation::Done => {}
