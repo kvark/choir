@@ -36,7 +36,7 @@ pub mod util;
 
 use crossbeam_deque::{Injector, Steal};
 use std::{
-    mem, ops,
+    fmt, mem, ops,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex, RwLock,
@@ -47,6 +47,7 @@ use std::{
 const BITS_PER_BYTE: usize = 8;
 const MAX_WORKERS: usize = mem::size_of::<usize>() * BITS_PER_BYTE;
 
+#[derive(Debug)]
 enum Continuation {
     Playing {
         dependents: Vec<Arc<Task>>,
@@ -56,6 +57,7 @@ enum Continuation {
 }
 
 /// An object responsible to notify follow-up tasks.
+#[derive(Debug)]
 pub struct Notifier {
     continuation: Mutex<Continuation>,
 }
@@ -79,17 +81,31 @@ pub type SubIndex = u32;
 
 enum Functor {
     Dummy,
-    Single(Box<dyn FnOnce(&Notifier) + Send + 'static>),
+    Once(Box<dyn FnOnce(&Notifier) + Send + 'static>),
     Multi(
         ops::Range<SubIndex>,
         Arc<dyn Fn(&Notifier, SubIndex) + Send + Sync + 'static>,
     ),
 }
 
+impl fmt::Debug for Functor {
+    fn fmt(&self, serializer: &mut fmt::Formatter) -> fmt::Result {
+        match &self {
+            Self::Dummy => serializer.debug_struct("Dummy").finish(),
+            Self::Once(_) => serializer.debug_struct("Once").finish(),
+            Self::Multi(ref range, _) => serializer
+                .debug_struct("Multi")
+                .field("range", range)
+                .finish(),
+        }
+    }
+}
+
 // This is totally safe. See:
 // https://internals.rust-lang.org/t/dyn-fnonce-should-always-be-sync/16470
 unsafe impl Sync for Functor {}
 
+#[derive(Debug)]
 struct Task {
     id: usize,
     functor: Functor,
@@ -138,7 +154,7 @@ impl Conductor {
                 log::debug!("Task {} (dummy) runs on thread[{}]", task.id, worker_index);
                 Some(task.notifier)
             }
-            Functor::Single(fun) => {
+            Functor::Once(fun) => {
                 log::debug!("Task {} runs on thread[{}]", task.id, worker_index);
                 profiling::scope!("execute");
                 (fun)(&task.notifier);
@@ -372,7 +388,7 @@ impl ProtoTask<'_> {
     /// The function body will be executed once the task is scheduled,
     /// and all of its dependencies are fulfulled.
     pub fn init<F: FnOnce(&Notifier) + Send + 'static>(self, fun: F) -> IdleTask {
-        self.fill(Functor::Single(Box::new(fun)))
+        self.fill(Functor::Once(Box::new(fun)))
     }
 
     /// Init task to execute a function multiple times.
@@ -407,6 +423,7 @@ impl ProtoTask<'_> {
 }
 
 /// Task that is already scheduled for running.
+#[derive(Debug)]
 pub struct RunningTask {
     notifier: Arc<Notifier>,
 }
