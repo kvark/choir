@@ -41,11 +41,12 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex, RwLock,
     },
-    thread,
+    thread, time,
 };
 
 const BITS_PER_BYTE: usize = 8;
 const MAX_WORKERS: usize = mem::size_of::<usize>() * BITS_PER_BYTE;
+const JOIN_PARK_TIME: time::Duration = time::Duration::from_millis(10);
 
 #[derive(Debug)]
 enum Continuation {
@@ -423,7 +424,7 @@ impl ProtoTask<'_> {
 }
 
 /// Task that is already scheduled for running.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct RunningTask {
     notifier: Arc<Notifier>,
 }
@@ -448,12 +449,18 @@ impl RunningTask {
             Continuation::Done => return,
         }
         loop {
-            thread::park();
+            thread::park_timeout(JOIN_PARK_TIME);
             match *self.notifier.continuation.lock().unwrap() {
                 Continuation::Playing { .. } => (),
                 Continuation::Done => return,
             }
         }
+    }
+}
+
+impl Default for Choir {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
