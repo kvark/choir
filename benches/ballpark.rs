@@ -6,10 +6,12 @@ fn many_tasks(c: &mut Criterion) {
         let mut choir = choir::Choir::new();
         let _worker = choir.add_worker("main");
         b.iter(|| {
+            let mut parent = choir.spawn("parent").init_dummy();
             for _ in 0..TASK_COUNT {
-                choir.spawn("").init(|_| {});
+                let task = choir.spawn("").init_dummy();
+                parent.depend_on(&task);
             }
-            choir.wait_idle();
+            parent.run().join();
         });
     });
     let num_cores = num_cpus::get_physical();
@@ -19,18 +21,23 @@ fn many_tasks(c: &mut Criterion) {
             .map(|i| choir.add_worker(&format!("worker-{}", i)))
             .collect::<Vec<_>>();
         b.iter(|| {
+            let mut parent = choir.spawn("parent").init_dummy();
             for _ in 0..TASK_COUNT {
-                choir.spawn("").init(|_| {});
+                let task = choir.spawn("").init_dummy();
+                parent.depend_on(&task);
             }
-            choir.wait_idle();
+            parent.run().join();
         });
     });
     c.bench_function("multi-task: single worker", |b| {
         let mut choir = choir::Choir::new();
         let _worker = choir.add_worker("main");
         b.iter(|| {
-            choir.spawn("").init_multi(TASK_COUNT, |_, _| {});
-            choir.wait_idle();
+            choir
+                .spawn("")
+                .init_multi(TASK_COUNT, |_, _| {})
+                .run()
+                .join();
         });
     });
     c.bench_function(&format!("multi-task: {} workers", num_cores), |b| {
@@ -39,8 +46,11 @@ fn many_tasks(c: &mut Criterion) {
             .map(|i| choir.add_worker(&format!("worker-{}", i)))
             .collect::<Vec<_>>();
         b.iter(|| {
-            choir.spawn("").init_multi(TASK_COUNT, |_, _| {});
-            choir.wait_idle();
+            choir
+                .spawn("")
+                .init_multi(TASK_COUNT, |_, _| {})
+                .run()
+                .join();
         });
     });
 }
