@@ -6,9 +6,10 @@ inside tasks, which are scheduled to run by the `Choir`.
 
 Lifetime of a Task:
   1. Idle: task is just created.
-  2. Scheduled: no more dependencies can be added to the task.
-  3. Executing: task was dispatched from the queue by one of the workers.
-  4. Done: task is retired.
+  2. Initialized: function body is assigned.
+  3. Scheduled: no more dependencies can be added to the task.
+  4. Executing: task was dispatched from the queue by one of the workers.
+  5. Done: task is retired.
 !*/
 
 #![allow(
@@ -60,6 +61,8 @@ enum Continuation {
 /// An object responsible to notify follow-up tasks.
 #[derive(Debug)]
 pub struct Notifier {
+    serial_id: usize,
+    name: String,
     continuation: Mutex<Continuation>,
 }
 
@@ -77,6 +80,12 @@ impl Notifier {
     }
 }
 
+impl fmt::Display for Notifier {
+    fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        write!(formatter, "'{}'@{}", self.name, self.serial_id)
+    }
+}
+
 /// Index of a sub-task inside a multi-task.
 pub type SubIndex = u32;
 
@@ -91,7 +100,7 @@ enum Functor {
 
 impl fmt::Debug for Functor {
     fn fmt(&self, serializer: &mut fmt::Formatter) -> fmt::Result {
-        match &self {
+        match self {
             Self::Dummy => serializer.debug_struct("Dummy").finish(),
             Self::Once(_) => serializer.debug_struct("Once").finish(),
             Self::Multi(ref range, _) => serializer
@@ -108,7 +117,6 @@ unsafe impl Sync for Functor {}
 
 #[derive(Debug)]
 struct Task {
-    id: usize,
     functor: Functor,
     /// This notifier is only really shared with `RunningTask`
     notifier: Arc<Notifier>,
@@ -135,7 +143,7 @@ struct Conductor {
 
 impl Conductor {
     fn schedule(&self, task: Task) {
-        log::trace!("Task {} is scheduled", task.id);
+        log::trace!("Task {} is scheduled", task.notifier);
         self.injector.push(task);
         // Wake up a thread if there is a sleeping one.
         let mask = self.parked_mask.load(Ordering::Acquire);
@@ -152,11 +160,15 @@ impl Conductor {
     fn execute(&self, task: Task, worker_index: usize) -> Option<Arc<Notifier>> {
         match task.functor {
             Functor::Dummy => {
-                log::debug!("Task {} (dummy) runs on thread[{}]", task.id, worker_index);
+                log::debug!(
+                    "Task {} (dummy) runs on thread[{}]",
+                    task.notifier,
+                    worker_index
+                );
                 Some(task.notifier)
             }
             Functor::Once(fun) => {
-                log::debug!("Task {} runs on thread[{}]", task.id, worker_index);
+                log::debug!("Task {} runs on thread[{}]", task.notifier, worker_index);
                 profiling::scope!("execute");
                 (fun)(&task.notifier);
                 Some(task.notifier)
@@ -164,7 +176,7 @@ impl Conductor {
             Functor::Multi(mut sub_range, mut fun) => {
                 log::debug!(
                     "Task {} ({}) runs on thread[{}]",
-                    task.id,
+                    task.notifier,
                     sub_range.start,
                     worker_index,
                 );
@@ -175,7 +187,6 @@ impl Conductor {
                     let mask = self.parked_mask.load(Ordering::Acquire);
                     if mask != 0 {
                         self.injector.push(Task {
-                            id: task.id,
                             functor: Functor::Multi(middle..sub_range.end, Arc::clone(&fun)),
                             notifier: Arc::clone(&task.notifier),
                         });
@@ -205,7 +216,6 @@ impl Conductor {
                     // Note: we aren't calling `schedule` because we know at least this very thread
                     // will be able to pick it up, so no need to wake up anybody.
                     self.injector.push(Task {
-                        id: task.id,
                         functor: Functor::Multi(sub_range, fun),
                         notifier: task.notifier,
                     });
@@ -215,10 +225,14 @@ impl Conductor {
         }
     }
 
-    fn finish(&self, continuation: &mut Continuation) {
+    fn finish(&self, notifier: &Notifier) {
         profiling::scope!("unblock");
         // mark the task as done
-        let dependents = match mem::replace(continuation, Continuation::Done) {
+        log::trace!("Finishing task {}", notifier);
+        let dependents = match mem::replace(
+            &mut *notifier.continuation.lock().unwrap(),
+            Continuation::Done,
+        ) {
             Continuation::Playing {
                 dependents,
                 waiting_threads,
@@ -268,7 +282,7 @@ impl Conductor {
                 }
                 Steal::Success(task) => {
                     if let Some(notifier) = self.execute(task, index) {
-                        self.finish(&mut *notifier.continuation.lock().unwrap());
+                        self.finish(&notifier);
                     }
                 }
                 Steal::Retry => {}
@@ -325,17 +339,18 @@ impl<T> MaybeArc<T> {
 
     fn extract(&mut self) -> Option<T> {
         match mem::replace(self, Self::Null) {
+            // No dependencies, can be launched now.
             Self::Unique(value) => Some(value),
-            _ => None,
+            // There are dependencies, potentially all resolved now.
+            Self::Shared(arc) => Arc::try_unwrap(arc).ok(),
+            // Already been extracted.
+            Self::Null => None,
         }
     }
 }
 
 /// Task construct without any functional logic.
 pub struct ProtoTask<'c> {
-    id: usize,
-    #[allow(unused)]
-    name: String,
     conductor: &'c Arc<Conductor>,
     notifier: Notifier,
 }
@@ -370,7 +385,6 @@ impl ProtoTask<'_> {
         IdleTask {
             conductor: Arc::clone(self.conductor),
             task: MaybeArc::new(Task {
-                id: self.id,
                 functor,
                 notifier: Arc::new(self.notifier),
             }),
@@ -439,6 +453,7 @@ impl RunningTask {
     /// Block until the task has finished executing.
     #[profiling::function]
     pub fn join(self) {
+        log::debug!("Joining {}", self.notifier);
         match *self.notifier.continuation.lock().unwrap() {
             Continuation::Playing {
                 dependents: _,
@@ -508,13 +523,13 @@ impl Choir {
     #[profiling::function]
     pub fn spawn(&self, name: &str) -> ProtoTask {
         let id = self.next_id.fetch_add(1, Ordering::AcqRel);
-        log::trace!("Creating task {}", id);
+        log::trace!("Creating task '{}'@{}", name, id);
 
         ProtoTask {
-            id,
-            name: name.to_string(),
             conductor: &self.conductor,
             notifier: Notifier {
+                serial_id: id,
+                name: name.to_string(),
                 continuation: Mutex::new(Continuation::Playing {
                     dependents: Vec::new(),
                     waiting_threads: Vec::new(),
@@ -541,10 +556,10 @@ impl Choir {
         };
 
         ProtoTask {
-            id,
-            name: name.to_string(),
             conductor: &self.conductor,
             notifier: Notifier {
+                serial_id: id,
+                name: name.to_string(),
                 continuation: Mutex::new(Continuation::Playing {
                     dependents,
                     waiting_threads: Vec::new(),
