@@ -86,6 +86,8 @@ unsafe fn qsort(data: Array, notifier: &choir::Notifier) {
 fn main() {
     const USE_TASKS: bool = true;
     const COUNT: usize = 10000000;
+    env_logger::init();
+
     let mut data = {
         let mut rng = rand::thread_rng();
         (0..COUNT).map(|_| rng.gen()).collect::<Vec<Value>>()

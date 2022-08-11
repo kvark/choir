@@ -10,6 +10,7 @@ profiler-tracy = ["profiling/profile-with-tracy"]
 
 [dependencies]
 choir = { path = ".." }
+env_logger = "0.9"
 num_cpus = "1"
 profiling = "1"
 rand = "0.8"

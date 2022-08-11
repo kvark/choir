@@ -42,12 +42,11 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex, RwLock,
     },
-    thread, time,
+    thread,
 };
 
 const BITS_PER_BYTE: usize = 8;
 const MAX_WORKERS: usize = mem::size_of::<usize>() * BITS_PER_BYTE;
-const JOIN_PARK_TIME: time::Duration = time::Duration::from_millis(10);
 
 #[derive(Debug)]
 enum Continuation {
@@ -270,14 +269,8 @@ impl Conductor {
                     log::trace!("Thread[{}] sleeps", index);
                     let mask = 1 << index;
                     self.parked_mask.fetch_or(mask, Ordering::AcqRel);
-                    //Note: this is a situation where we are about to sleep,
-                    // and a new task is being scheduled at the same time.
-                    if self.injector.is_empty() {
-                        profiling::scope!("park");
-                        thread::park();
-                    } else {
-                        log::trace!("\tno, queue is not empty");
-                    }
+                    profiling::scope!("park");
+                    thread::park();
                     self.parked_mask.fetch_and(!mask, Ordering::AcqRel);
                 }
                 Steal::Success(task) => {
@@ -464,7 +457,7 @@ impl RunningTask {
             Continuation::Done => return,
         }
         loop {
-            thread::park_timeout(JOIN_PARK_TIME);
+            thread::park();
             match *self.notifier.continuation.lock().unwrap() {
                 Continuation::Playing { .. } => (),
                 Continuation::Done => return,
