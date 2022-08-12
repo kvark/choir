@@ -170,11 +170,12 @@ impl Conductor {
     fn schedule(&self, task: Task) {
         log::trace!("Task {} is scheduled", task.notifier);
         self.injector.push(task);
-        // Wake up a thread if there is a sleeping one.
         let mask = self.parked_mask.load(Ordering::Acquire);
+        // Wake up a thread if there is a sleeping one.
         if mask != 0 {
             let index = mask.trailing_zeros() as usize;
             profiling::scope!("unpark");
+            log::trace!("\twaking up thread[{}]", index);
             let pool = self.workers.read().unwrap();
             if let Some(context) = pool.contexts[index].as_ref() {
                 context.thread.unpark();
@@ -260,6 +261,7 @@ impl Conductor {
         log::trace!("Finishing task {}", notifier);
         let continuation = notifier.continuation.lock().unwrap().take().unwrap();
         for thread in continuation.waiting_threads {
+            log::trace!("\tresolving a join");
             thread.unpark();
         }
         // unblock dependencies if needed
@@ -288,8 +290,13 @@ impl Conductor {
                     log::trace!("Thread[{}] sleeps", index);
                     let mask = 1 << index;
                     self.parked_mask.fetch_or(mask, Ordering::AcqRel);
-                    profiling::scope!("park");
-                    thread::park();
+                    if self.injector.is_empty() {
+                        // We are on our way to sleep, but there might be
+                        // a `schedule()` call running elsewhere,
+                        // missing our parked bit.
+                        profiling::scope!("park");
+                        thread::park();
+                    }
                     self.parked_mask.fetch_and(!mask, Ordering::AcqRel);
                 }
                 Steal::Success(task) => {
@@ -473,6 +480,7 @@ impl RunningTask {
             None => return,
         }
         loop {
+            log::trace!("Parking for {}", self.notifier);
             thread::park();
             if self.notifier.continuation.lock().unwrap().is_none() {
                 return;
