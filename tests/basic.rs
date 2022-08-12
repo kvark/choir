@@ -110,22 +110,20 @@ fn proxy() {
     let mut choir = choir::Choir::new();
     let _worker1 = choir.add_worker("A");
     let _worker2 = choir.add_worker("B");
-    let choir_arc = Arc::new(choir);
 
     let value = Arc::new(AtomicUsize::new(0));
-    let choir_other = Arc::clone(&choir_arc);
     let value_other = Arc::clone(&value);
     let n = 50;
-    let compute = choir_arc.spawn("parent").init_multi(n, move |notifier, i| {
+    let compute = choir.spawn("parent").init_multi(n, move |ec, i| {
         println!("base[{}]", i);
         let value_other2 = Arc::clone(&value_other);
         value_other.fetch_or(1 << i, Ordering::SeqCst);
-        choir_other.spawn_proxy("proxy", notifier).init(move |_| {
+        ec.fork("proxy").init(move |_| {
             println!("proxy[{}]", i);
             value_other2.fetch_xor(1 << i, Ordering::SeqCst);
         });
     });
-    let mut test = choir_arc.spawn("test").init(move |_| {
+    let mut test = choir.spawn("test").init(move |_| {
         assert_eq!(value.load(Ordering::Acquire), 0);
     });
     test.depend_on(&compute);

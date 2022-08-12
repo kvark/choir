@@ -56,7 +56,7 @@ struct Continuation {
 
 /// An object responsible to notify follow-up tasks.
 #[derive(Debug)]
-pub struct Notifier {
+struct Notifier {
     serial_id: usize,
     name: String,
     continuation: Mutex<Option<Continuation>>,
@@ -76,15 +76,49 @@ impl fmt::Display for Notifier {
     }
 }
 
+/// Context of a task execution body.
+pub struct ExecutionContext<'a> {
+    conductor: &'a Arc<Conductor>,
+    notifier: &'a Notifier,
+}
+
+impl ExecutionContext<'_> {
+    /// Fork the current task.
+    ///
+    /// This is useful because it allows creating tasks on the fly from within
+    /// other tasks. Generally, making a task in flight depend on anything is impossible.
+    /// But one can fork a dependency instead.
+    pub fn fork(&self, name: &str) -> ProtoTask {
+        log::trace!("Forking task {} as '{}'", self.notifier, name);
+
+        let dependents = {
+            let cont = self.notifier.continuation.lock().unwrap();
+            cont.as_ref().unwrap().dependents.clone()
+        };
+
+        ProtoTask {
+            conductor: self.conductor,
+            notifier: Notifier {
+                serial_id: self.notifier.serial_id,
+                name: name.to_string(),
+                continuation: Mutex::new(Some(Continuation {
+                    dependents,
+                    waiting_threads: Vec::new(),
+                })),
+            },
+        }
+    }
+}
+
 /// Index of a sub-task inside a multi-task.
 pub type SubIndex = u32;
 
 enum Functor {
     Dummy,
-    Once(Box<dyn FnOnce(&Notifier) + Send + 'static>),
+    Once(Box<dyn FnOnce(ExecutionContext) + Send + 'static>),
     Multi(
         ops::Range<SubIndex>,
-        Arc<dyn Fn(&Notifier, SubIndex) + Send + Sync + 'static>,
+        Arc<dyn Fn(ExecutionContext, SubIndex) + Send + Sync + 'static>,
     ),
 }
 
@@ -148,7 +182,11 @@ impl Conductor {
         }
     }
 
-    fn execute(&self, task: Task, worker_index: usize) -> Option<Arc<Notifier>> {
+    fn execute(self: &Arc<Self>, task: Task, worker_index: usize) -> Option<Arc<Notifier>> {
+        let execontext = ExecutionContext {
+            conductor: self,
+            notifier: &task.notifier,
+        };
         match task.functor {
             Functor::Dummy => {
                 log::debug!(
@@ -161,7 +199,7 @@ impl Conductor {
             Functor::Once(fun) => {
                 log::debug!("Task {} runs on thread[{}]", task.notifier, worker_index);
                 profiling::scope!("execute");
-                (fun)(&task.notifier);
+                (fun)(execontext);
                 Some(task.notifier)
             }
             Functor::Multi(mut sub_range, mut fun) => {
@@ -196,7 +234,7 @@ impl Conductor {
                     }
                 }
                 // fun the functor
-                (fun)(&task.notifier, sub_range.start);
+                (fun)(execontext, sub_range.start);
                 // are we done yet?
                 sub_range.start += 1;
                 if sub_range.start == sub_range.end {
@@ -232,7 +270,7 @@ impl Conductor {
         }
     }
 
-    fn work_loop(&self, worker: &Worker) {
+    fn work_loop(self: &Arc<Self>, worker: &Worker) {
         profiling::register_thread!();
         let index = {
             let mut pool = self.workers.write().unwrap();
@@ -376,14 +414,14 @@ impl ProtoTask<'_> {
     /// Init task to execute a standalone function.
     /// The function body will be executed once the task is scheduled,
     /// and all of its dependencies are fulfulled.
-    pub fn init<F: FnOnce(&Notifier) + Send + 'static>(self, fun: F) -> IdleTask {
+    pub fn init<F: FnOnce(ExecutionContext) + Send + 'static>(self, fun: F) -> IdleTask {
         self.fill(Functor::Once(Box::new(fun)))
     }
 
     /// Init task to execute a function multiple times.
     /// Every invocation is given an index in 0..count
     /// There are no ordering guarantees between the indices.
-    pub fn init_multi<F: Fn(&Notifier, SubIndex) + Send + Sync + 'static>(
+    pub fn init_multi<F: Fn(ExecutionContext, SubIndex) + Send + Sync + 'static>(
         self,
         count: SubIndex,
         fun: F,
@@ -502,33 +540,6 @@ impl Choir {
                 name: name.to_string(),
                 continuation: Mutex::new(Some(Continuation {
                     dependents: Vec::new(),
-                    waiting_threads: Vec::new(),
-                })),
-            },
-        }
-    }
-
-    /// Spawn a task that shares a given notifier.
-    ///
-    /// This is useful because it allows creating tasks on the fly from within
-    /// other tasks. Generally, making a task in flight depend on anything is impossible.
-    /// But one can create a proxy task from a dependency
-    pub fn spawn_proxy(&self, name: &str, notifier: &Notifier) -> ProtoTask {
-        let id = self.next_id.fetch_add(1, Ordering::AcqRel);
-        log::trace!("Creating proxy task {}", id);
-
-        let dependents = {
-            let cont = notifier.continuation.lock().unwrap();
-            cont.as_ref().unwrap().dependents.clone()
-        };
-
-        ProtoTask {
-            conductor: &self.conductor,
-            notifier: Notifier {
-                serial_id: id,
-                name: name.to_string(),
-                continuation: Mutex::new(Some(Continuation {
-                    dependents,
                     waiting_threads: Vec::new(),
                 })),
             },
