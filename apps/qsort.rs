@@ -72,10 +72,8 @@ unsafe fn qsort(data: Array, context: choir::ExecutionContext) {
             ptr: data.ptr.add(right_start),
             count: data.count - right_start,
         };
-        context.fork("left")
-            .init(move |ec| qsort(left, ec));
-        context.fork("right")
-            .init(move |ec| qsort(right, ec));
+        context.fork("left").init(move |ec| qsort(left, ec));
+        context.fork("right").init(move |ec| qsort(right, ec));
     } else if data.count > 1 {
         insertion_sort(slice::from_raw_parts_mut(data.ptr, data.count))
     }
