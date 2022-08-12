@@ -49,12 +49,9 @@ const BITS_PER_BYTE: usize = 8;
 const MAX_WORKERS: usize = mem::size_of::<usize>() * BITS_PER_BYTE;
 
 #[derive(Debug)]
-enum Continuation {
-    Playing {
-        dependents: Vec<Arc<Task>>,
-        waiting_threads: Vec<thread::Thread>,
-    },
-    Done,
+struct Continuation {
+    dependents: Vec<Arc<Task>>,
+    waiting_threads: Vec<thread::Thread>,
 }
 
 /// An object responsible to notify follow-up tasks.
@@ -62,19 +59,13 @@ enum Continuation {
 pub struct Notifier {
     serial_id: usize,
     name: String,
-    continuation: Mutex<Continuation>,
+    continuation: Mutex<Option<Continuation>>,
 }
 
 impl Notifier {
     fn block(&self, task: Arc<Task>) {
-        match *self.continuation.lock().unwrap() {
-            Continuation::Playing {
-                ref mut dependents,
-                waiting_threads: _,
-            } => {
-                dependents.push(task);
-            }
-            Continuation::Done => {}
+        if let Some(ref mut cont) = *self.continuation.lock().unwrap() {
+            cont.dependents.push(task);
         }
     }
 }
@@ -99,7 +90,7 @@ enum Functor {
 
 impl fmt::Debug for Functor {
     fn fmt(&self, serializer: &mut fmt::Formatter) -> fmt::Result {
-        match self {
+        match *self {
             Self::Dummy => serializer.debug_struct("Dummy").finish(),
             Self::Once(_) => serializer.debug_struct("Once").finish(),
             Self::Multi(ref range, _) => serializer
@@ -116,6 +107,7 @@ unsafe impl Sync for Functor {}
 
 #[derive(Debug)]
 struct Task {
+    /// Body of the task.
     functor: Functor,
     /// This notifier is only really shared with `RunningTask`
     notifier: Arc<Notifier>,
@@ -228,23 +220,12 @@ impl Conductor {
         profiling::scope!("unblock");
         // mark the task as done
         log::trace!("Finishing task {}", notifier);
-        let dependents = match mem::replace(
-            &mut *notifier.continuation.lock().unwrap(),
-            Continuation::Done,
-        ) {
-            Continuation::Playing {
-                dependents,
-                waiting_threads,
-            } => {
-                for thread in waiting_threads {
-                    thread.unpark();
-                }
-                dependents
-            }
-            Continuation::Done => unreachable!(),
-        };
+        let continuation = notifier.continuation.lock().unwrap().take().unwrap();
+        for thread in continuation.waiting_threads {
+            thread.unpark();
+        }
         // unblock dependencies if needed
-        for dependent in dependents {
+        for dependent in continuation.dependents {
             if let Ok(ready) = Arc::try_unwrap(dependent) {
                 self.schedule(ready);
             }
@@ -448,19 +429,15 @@ impl RunningTask {
     pub fn join(self) {
         log::debug!("Joining {}", self.notifier);
         match *self.notifier.continuation.lock().unwrap() {
-            Continuation::Playing {
-                dependents: _,
-                ref mut waiting_threads,
-            } => {
-                waiting_threads.push(thread::current());
+            Some(ref mut cont) => {
+                cont.waiting_threads.push(thread::current());
             }
-            Continuation::Done => return,
+            None => return,
         }
         loop {
             thread::park();
-            match *self.notifier.continuation.lock().unwrap() {
-                Continuation::Playing { .. } => (),
-                Continuation::Done => return,
+            if self.notifier.continuation.lock().unwrap().is_none() {
+                return;
             }
         }
     }
@@ -523,10 +500,10 @@ impl Choir {
             notifier: Notifier {
                 serial_id: id,
                 name: name.to_string(),
-                continuation: Mutex::new(Continuation::Playing {
+                continuation: Mutex::new(Some(Continuation {
                     dependents: Vec::new(),
                     waiting_threads: Vec::new(),
-                }),
+                })),
             },
         }
     }
@@ -540,12 +517,9 @@ impl Choir {
         let id = self.next_id.fetch_add(1, Ordering::AcqRel);
         log::trace!("Creating proxy task {}", id);
 
-        let dependents = match *notifier.continuation.lock().unwrap() {
-            Continuation::Playing {
-                ref dependents,
-                waiting_threads: _,
-            } => dependents.clone(),
-            Continuation::Done => unreachable!(),
+        let dependents = {
+            let cont = notifier.continuation.lock().unwrap();
+            cont.as_ref().unwrap().dependents.clone()
         };
 
         ProtoTask {
@@ -553,10 +527,10 @@ impl Choir {
             notifier: Notifier {
                 serial_id: id,
                 name: name.to_string(),
-                continuation: Mutex::new(Continuation::Playing {
+                continuation: Mutex::new(Some(Continuation {
                     dependents,
                     waiting_threads: Vec::new(),
-                }),
+                })),
             },
         }
     }
