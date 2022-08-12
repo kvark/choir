@@ -61,7 +61,7 @@ unsafe fn split(data: Array) -> (usize, usize) {
     }
 }
 
-unsafe fn qsort(data: Array, notifier: &choir::Notifier) {
+unsafe fn qsort(data: Array, context: choir::ExecutionContext) {
     if data.count > 5 {
         let (left_end, right_start) = split(data);
         let left = Array {
@@ -72,12 +72,10 @@ unsafe fn qsort(data: Array, notifier: &choir::Notifier) {
             ptr: data.ptr.add(right_start),
             count: data.count - right_start,
         };
-        (*CHOIR)
-            .spawn_proxy("left", notifier)
-            .init(move |n| qsort(left, n));
-        (*CHOIR)
-            .spawn_proxy("right", notifier)
-            .init(move |n| qsort(right, n));
+        context.fork("left")
+            .init(move |ec| qsort(left, ec));
+        context.fork("right")
+            .init(move |ec| qsort(right, ec));
     } else if data.count > 1 {
         insertion_sort(slice::from_raw_parts_mut(data.ptr, data.count))
     }
@@ -106,7 +104,7 @@ fn main() {
         }
         let main = choir
             .spawn("main")
-            .init(move |n| unsafe { qsort(data_raw, n) });
+            .init(move |ec| unsafe { qsort(data_raw, ec) });
 
         let mut done = choir.spawn("done").init_dummy();
         done.depend_on(&main);
