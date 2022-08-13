@@ -1,5 +1,5 @@
 use rand::Rng as _;
-use std::{mem, ptr, slice};
+use std::{ptr, slice};
 
 type Value = i64;
 
@@ -48,13 +48,13 @@ unsafe fn split(data: Array) -> (usize, usize) {
                 break 'outer;
             }
         }
-        mem::swap(&mut *data.ptr.add(i), &mut *data.ptr.add(j));
+        ptr::swap(&mut *data.ptr.add(i), &mut *data.ptr.add(j));
         i += 1;
         j -= 1;
     }
     // guarantee that the element in the middle can be excluded
     if *data.ptr.add(j) <= mid {
-        mem::swap(&mut *data.ptr, &mut *data.ptr.add(j));
+        ptr::swap(&mut *data.ptr, &mut *data.ptr.add(j));
         (j, j + 1)
     } else {
         (j, j)
