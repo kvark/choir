@@ -20,7 +20,8 @@ Lifetime of a Task:
     clippy::manual_strip,
     clippy::if_same_then_else,
     clippy::unknown_clippy_lints,
-    clippy::len_without_is_empty
+    clippy::len_without_is_empty,
+    clippy::should_implement_trait
 )]
 #![warn(
     missing_docs,
@@ -32,9 +33,12 @@ Lifetime of a Task:
 )]
 //#![forbid(unsafe_code)]
 
+/// Better shared pointer.
+pub mod arc;
 /// Additional utilities.
 pub mod util;
 
+use self::arc::Linearc;
 use crossbeam_deque::{Injector, Steal};
 use std::{
     fmt, mem, ops,
@@ -50,7 +54,7 @@ const MAX_WORKERS: usize = mem::size_of::<usize>() * BITS_PER_BYTE;
 
 #[derive(Debug)]
 struct Continuation {
-    dependents: Vec<Arc<Task>>,
+    dependents: Vec<Linearc<Task>>,
     waiting_threads: Vec<thread::Thread>,
 }
 
@@ -63,7 +67,7 @@ struct Notifier {
 }
 
 impl Notifier {
-    fn block(&self, task: Arc<Task>) {
+    fn block(&self, task: Linearc<Task>) {
         if let Some(ref mut cont) = *self.continuation.lock().unwrap() {
             cont.dependents.push(task);
         }
@@ -118,7 +122,7 @@ enum Functor {
     Once(Box<dyn FnOnce(ExecutionContext) + Send + 'static>),
     Multi(
         ops::Range<SubIndex>,
-        Arc<dyn Fn(ExecutionContext, SubIndex) + Send + Sync + 'static>,
+        Linearc<dyn Fn(ExecutionContext, SubIndex) + Send + Sync + 'static>,
     ),
 }
 
@@ -203,7 +207,7 @@ impl Conductor {
                 (fun)(execontext);
                 Some(task.notifier)
             }
-            Functor::Multi(mut sub_range, mut fun) => {
+            Functor::Multi(mut sub_range, fun) => {
                 log::debug!(
                     "Task {} ({}) runs on thread[{}]",
                     task.notifier,
@@ -217,7 +221,7 @@ impl Conductor {
                     let mask = self.parked_mask.load(Ordering::Acquire);
                     if mask != 0 {
                         self.injector.push(Task {
-                            functor: Functor::Multi(middle..sub_range.end, Arc::clone(&fun)),
+                            functor: Functor::Multi(middle..sub_range.end, Linearc::clone(&fun)),
                             notifier: Arc::clone(&task.notifier),
                         });
                         let index = mask.trailing_zeros() as usize;
@@ -239,8 +243,11 @@ impl Conductor {
                 // are we done yet?
                 sub_range.start += 1;
                 if sub_range.start == sub_range.end {
-                    // return the notifier if this is the last task in the set
-                    Arc::get_mut(&mut fun).map(|_| task.notifier)
+                    if Linearc::drop_last(fun) {
+                        Some(task.notifier)
+                    } else {
+                        None
+                    }
                 } else {
                     // Put it back to the queue, with the next sub-index.
                     // Note: we aren't calling `schedule` because we know at least this very thread
@@ -266,7 +273,7 @@ impl Conductor {
         }
         // unblock dependencies if needed
         for dependent in continuation.dependents {
-            if let Ok(ready) = Arc::try_unwrap(dependent) {
+            if let Some(ready) = Linearc::into_inner(dependent) {
                 self.schedule(ready);
             }
         }
@@ -289,7 +296,7 @@ impl Conductor {
                 Steal::Empty => {
                     log::trace!("Thread[{}] sleeps", index);
                     let mask = 1 << index;
-                    self.parked_mask.fetch_or(mask, Ordering::AcqRel);
+                    self.parked_mask.fetch_or(mask, Ordering::Release);
                     if self.injector.is_empty() {
                         // We are on our way to sleep, but there might be
                         // a `schedule()` call running elsewhere,
@@ -297,7 +304,7 @@ impl Conductor {
                         profiling::scope!("park");
                         thread::park();
                     }
-                    self.parked_mask.fetch_and(!mask, Ordering::AcqRel);
+                    self.parked_mask.fetch_and(!mask, Ordering::Release);
                 }
                 Steal::Success(task) => {
                     if let Some(notifier) = self.execute(task, index) {
@@ -327,7 +334,7 @@ pub struct WorkerHandle {
 
 enum MaybeArc<T> {
     Unique(T),
-    Shared(Arc<T>),
+    Shared(Linearc<T>),
     Null,
 }
 
@@ -338,13 +345,13 @@ impl<T> MaybeArc<T> {
         Self::Unique(value)
     }
 
-    fn share(&mut self) -> Arc<T> {
+    fn share(&mut self) -> Linearc<T> {
         let arc = match mem::replace(self, Self::Null) {
-            Self::Unique(value) => Arc::new(value),
+            Self::Unique(value) => Linearc::new(value),
             Self::Shared(arc) => arc,
             Self::Null => panic!("{}", Self::NULL_ERROR),
         };
-        *self = Self::Shared(Arc::clone(&arc));
+        *self = Self::Shared(Linearc::clone(&arc));
         arc
     }
 
@@ -361,7 +368,7 @@ impl<T> MaybeArc<T> {
             // No dependencies, can be launched now.
             Self::Unique(value) => Some(value),
             // There are dependencies, potentially all resolved now.
-            Self::Shared(arc) => Arc::try_unwrap(arc).ok(),
+            Self::Shared(arc) => Linearc::into_inner(arc),
             // Already been extracted.
             Self::Null => None,
         }
@@ -396,6 +403,18 @@ impl Dependency for ProtoTask<'_> {
 impl Dependency for IdleTask {
     fn block(&self, idle: &mut IdleTask) {
         self.task.as_ref().notifier.block(idle.task.share());
+    }
+}
+
+//HACK: turns out, it's impossible to re-implement `Arc` in Rust stable userspace,
+// Because `Arc` relies on `trait Unsized` and `std::ops::CoerceUnsized`, which
+// are still nightly-only behind a feature.
+impl Linearc<dyn Fn(ExecutionContext, SubIndex) + Send + Sync + 'static> {
+    fn new_unsized(fun: impl Fn(ExecutionContext, SubIndex) + Send + Sync + 'static) -> Self {
+        Self::from_inner(Box::new(arc::LinearcInner {
+            ref_count: AtomicUsize::new(1),
+            data: fun,
+        }))
     }
 }
 
@@ -436,7 +455,7 @@ impl ProtoTask<'_> {
         self.fill(if count == 0 {
             Functor::Dummy
         } else {
-            Functor::Multi(0..count, Arc::new(fun))
+            Functor::Multi(0..count, Linearc::new_unsized(fun))
         })
     }
 
@@ -472,6 +491,7 @@ impl RunningTask {
     /// Block until the task has finished executing.
     #[profiling::function]
     pub fn join(self) {
+        use std::time;
         log::debug!("Joining {}", self.notifier);
         match *self.notifier.continuation.lock().unwrap() {
             Some(ref mut cont) => {
@@ -479,11 +499,21 @@ impl RunningTask {
             }
             None => return,
         }
+        let instant = time::Instant::now();
+        let timeout = time::Duration::from_secs(5);
         loop {
             log::trace!("Parking for {}", self.notifier);
-            thread::park();
+            thread::park_timeout(timeout);
             if self.notifier.continuation.lock().unwrap().is_none() {
                 return;
+            }
+            if instant.elapsed() > timeout {
+                println!("Join timeout reached for {}", self.notifier);
+                println!(
+                    "Continuation: {:?}",
+                    self.notifier.continuation.lock().unwrap()
+                );
+                panic!("");
             }
         }
     }
