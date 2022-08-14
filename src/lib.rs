@@ -60,18 +60,10 @@ struct Continuation {
 
 /// An object responsible to notify follow-up tasks.
 #[derive(Debug)]
-struct Notifier {
+pub struct Notifier {
     serial_id: usize,
     name: String,
     continuation: Mutex<Option<Continuation>>,
-}
-
-impl Notifier {
-    fn block(&self, task: Linearc<Task>) {
-        if let Some(ref mut cont) = *self.continuation.lock().unwrap() {
-            cont.dependents.push(task);
-        }
-    }
 }
 
 impl fmt::Display for Notifier {
@@ -388,21 +380,9 @@ pub struct IdleTask {
     task: MaybeArc<Task>,
 }
 
-/// Ability to block a task that hasn't started yet.
-pub trait Dependency {
-    /// Prevent the specified task from running until self is done.
-    fn block(&self, idle: &mut IdleTask);
-}
-
-impl Dependency for ProtoTask<'_> {
-    fn block(&self, idle: &mut IdleTask) {
-        self.notifier.block(idle.task.share());
-    }
-}
-
-impl Dependency for IdleTask {
-    fn block(&self, idle: &mut IdleTask) {
-        self.task.as_ref().notifier.block(idle.task.share());
+impl AsRef<Notifier> for IdleTask {
+    fn as_ref(&self) -> &Notifier {
+        &self.task.as_ref().notifier
     }
 }
 
@@ -481,9 +461,9 @@ pub struct RunningTask {
     notifier: Arc<Notifier>,
 }
 
-impl Dependency for RunningTask {
-    fn block(&self, idle: &mut IdleTask) {
-        self.notifier.block(idle.task.share());
+impl AsRef<Notifier> for RunningTask {
+    fn as_ref(&self) -> &Notifier {
+        &self.notifier
     }
 }
 
@@ -606,8 +586,10 @@ impl IdleTask {
     }
 
     /// Add a dependency on another task, which is possibly running.
-    pub fn depend_on<D: Dependency>(&mut self, dependency: &D) {
-        dependency.block(self);
+    pub fn depend_on<D: AsRef<Notifier>>(&mut self, dependency: &D) {
+        if let Some(ref mut cont) = *dependency.as_ref().continuation.lock().unwrap() {
+            cont.dependents.push(self.task.share());
+        }
     }
 }
 
