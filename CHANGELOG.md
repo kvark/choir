@@ -1,12 +1,13 @@
 # Change Log
 
 ## v0.5 (TBD)
-  - all functors accept an argument of `Notifier`
-  - ability to spawn proxy tasks from a functor body
+  - all functors accept an argument of `ExecutionContext`
+  - ability to fork tasks from a functor body
   - `RunningTask::join()` instead of `Choir::wait_all`
   - intermediate `ProtoTask` type
   - `impl Clone for RunningTask`
   - everything implements `Debug`
+  - new `Linearc` type for linearized `Arc`
 
 ### v0.4.2 (07-06-2022)
   - dummy tasks support
