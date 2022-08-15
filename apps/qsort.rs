@@ -3,8 +3,6 @@ use std::{ptr, slice};
 
 type Value = i64;
 
-static mut CHOIR: *const choir::Choir = ptr::null();
-
 #[derive(Clone, Copy)]
 struct Array {
     ptr: *mut Value,
@@ -97,21 +95,11 @@ fn main() {
         let mut choir = choir::Choir::new();
         let _worker1 = choir.add_worker("worker1");
         let _worker2 = choir.add_worker("worker2");
-        unsafe {
-            CHOIR = &choir as *const _;
-        }
-        let main = choir
+        choir
             .spawn("main")
-            .init(move |ec| unsafe { qsort(data_raw, ec) });
-
-        let mut done = choir.spawn("done").init_dummy();
-        done.depend_on(&main);
-        main.run();
-        done.run().join();
-
-        unsafe {
-            CHOIR = ptr::null();
-        }
+            .init(move |ec| unsafe { qsort(data_raw, ec) })
+            .run()
+            .join();
     } else {
         insertion_sort(&mut data);
     }

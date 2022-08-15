@@ -46,14 +46,15 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex, RwLock,
     },
-    thread,
+    thread, time,
 };
 
 const BITS_PER_BYTE: usize = 8;
 const MAX_WORKERS: usize = mem::size_of::<usize>() * BITS_PER_BYTE;
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct Continuation {
+    forks: usize,
     dependents: Vec<Linearc<Task>>,
     waiting_threads: Vec<thread::Thread>,
 }
@@ -63,6 +64,7 @@ struct Continuation {
 pub struct Notifier {
     serial_id: usize,
     name: String,
+    parent: Option<Arc<Notifier>>,
     continuation: Mutex<Option<Continuation>>,
 }
 
@@ -75,7 +77,7 @@ impl fmt::Display for Notifier {
 /// Context of a task execution body.
 pub struct ExecutionContext<'a> {
     conductor: &'a Arc<Conductor>,
-    notifier: &'a Notifier,
+    notifier: &'a Arc<Notifier>,
 }
 
 impl ExecutionContext<'_> {
@@ -86,21 +88,13 @@ impl ExecutionContext<'_> {
     /// But one can fork a dependency instead.
     pub fn fork(&self, name: &str) -> ProtoTask {
         log::trace!("Forking task {} as '{}'", self.notifier, name);
-
-        let dependents = {
-            let cont = self.notifier.continuation.lock().unwrap();
-            cont.as_ref().unwrap().dependents.clone()
-        };
-
         ProtoTask {
             conductor: self.conductor,
             notifier: Notifier {
                 serial_id: self.notifier.serial_id,
                 name: name.to_string(),
-                continuation: Mutex::new(Some(Continuation {
-                    dependents,
-                    waiting_threads: Vec::new(),
-                })),
+                parent: Some(Arc::clone(self.notifier)),
+                continuation: Mutex::new(Some(Continuation::default())),
             },
         }
     }
@@ -258,16 +252,32 @@ impl Conductor {
         profiling::scope!("unblock");
         // mark the task as done
         log::trace!("Finishing task {}", notifier);
-        let continuation = notifier.continuation.lock().unwrap().take().unwrap();
+
+        let continuation = {
+            let mut guard = notifier.continuation.lock().unwrap();
+            if let Some(ref mut cont) = *guard {
+                if cont.forks != 0 {
+                    cont.forks -= 1;
+                    return;
+                }
+            }
+            guard.take().unwrap()
+        };
+
         for thread in continuation.waiting_threads {
             log::trace!("\tresolving a join");
             thread.unpark();
         }
+
         // unblock dependencies if needed
         for dependent in continuation.dependents {
             if let Some(ready) = Linearc::into_inner(dependent) {
                 self.schedule(ready);
             }
+        }
+
+        if let Some(ref parent_notifier) = notifier.parent {
+            self.finish(parent_notifier);
         }
     }
 
@@ -400,6 +410,16 @@ impl Linearc<dyn Fn(ExecutionContext, SubIndex) + Send + Sync + 'static> {
 
 impl ProtoTask<'_> {
     fn fill(self, functor: Functor) -> IdleTask {
+        // Only register the fork here, so that nothing happens if a `ProtoTask` is dropped.
+        if let Some(ref parent_notifier) = self.notifier.parent {
+            parent_notifier
+                .continuation
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .forks += 1;
+        }
         IdleTask {
             conductor: Arc::clone(self.conductor),
             task: MaybeArc::new(Task {
@@ -471,7 +491,25 @@ impl RunningTask {
     /// Block until the task has finished executing.
     #[profiling::function]
     pub fn join(self) {
-        use std::time;
+        log::debug!("Joining {}", self.notifier);
+        match *self.notifier.continuation.lock().unwrap() {
+            Some(ref mut cont) => {
+                cont.waiting_threads.push(thread::current());
+            }
+            None => return,
+        }
+        loop {
+            log::trace!("Parking for {}", self.notifier);
+            thread::park();
+            if self.notifier.continuation.lock().unwrap().is_none() {
+                return;
+            }
+        }
+    }
+
+    /// Block until the task has finished executing, with timeout.
+    /// Panics and prints helpful info if the timeout is reached.
+    pub fn join_debug(self, timeout: time::Duration) {
         log::debug!("Joining {}", self.notifier);
         match *self.notifier.continuation.lock().unwrap() {
             Some(ref mut cont) => {
@@ -480,7 +518,6 @@ impl RunningTask {
             None => return,
         }
         let instant = time::Instant::now();
-        let timeout = time::Duration::from_secs(5);
         loop {
             log::trace!("Parking for {}", self.notifier);
             thread::park_timeout(timeout);
@@ -556,10 +593,8 @@ impl Choir {
             notifier: Notifier {
                 serial_id: id,
                 name: name.to_string(),
-                continuation: Mutex::new(Some(Continuation {
-                    dependents: Vec::new(),
-                    waiting_threads: Vec::new(),
-                })),
+                parent: None,
+                continuation: Mutex::new(Some(Continuation::default())),
             },
         }
     }
