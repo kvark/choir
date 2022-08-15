@@ -275,10 +275,6 @@ impl Conductor {
                 self.schedule(ready);
             }
         }
-
-        if let Some(ref parent_notifier) = notifier.parent {
-            self.finish(parent_notifier);
-        }
     }
 
     fn work_loop(self: &Arc<Self>, worker: &Worker) {
@@ -309,8 +305,11 @@ impl Conductor {
                     self.parked_mask.fetch_and(!mask, Ordering::Release);
                 }
                 Steal::Success(task) => {
-                    if let Some(notifier) = self.execute(task, index) {
-                        self.finish(&notifier);
+                    let notifier_maybe = self.execute(task, index);
+                    let mut notifier_ref = notifier_maybe.as_ref();
+                    while let Some(notifier) = notifier_ref {
+                        self.finish(notifier);
+                        notifier_ref = notifier.parent.as_ref();
                     }
                 }
                 Steal::Retry => {}
