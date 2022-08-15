@@ -14,10 +14,15 @@ jobs:
           toolchain: "1.56.0"
           override: true
       - uses: actions-rs/cargo@v1
-        name: Test all features
+        name: Main check
         with:
           command: check
           args: --workspace
+      - uses: actions-rs/cargo@v1
+        name: Bench compile check
+        with:
+          command: bench
+          args: --no-run
   test:
     name: Test Nightly
     runs-on: ubuntu-latest
@@ -37,11 +42,6 @@ jobs:
         with:
           command: test
           args: --workspace
-      - uses: actions-rs/cargo@v1
-        name: Build the bench
-        with:
-          command: bench
-          args: --no-run
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
