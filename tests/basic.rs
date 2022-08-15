@@ -114,19 +114,19 @@ fn proxy() {
     let value = Arc::new(AtomicUsize::new(0));
     let value_other = Arc::clone(&value);
     let n = 50;
-    let compute = choir.spawn("parent").init_multi(n, move |ec, i| {
-        println!("base[{}]", i);
-        let value_other2 = Arc::clone(&value_other);
-        value_other.fetch_or(1 << i, Ordering::SeqCst);
-        ec.fork("proxy").init(move |_| {
-            println!("proxy[{}]", i);
-            value_other2.fetch_xor(1 << i, Ordering::SeqCst);
-        });
-    });
-    let mut test = choir.spawn("test").init(move |_| {
-        assert_eq!(value.load(Ordering::Acquire), 0);
-    });
-    test.depend_on(&compute);
-    compute.run();
-    test.run().join();
+    choir
+        .spawn("parent")
+        .init_multi(n, move |ec, i| {
+            println!("base[{}]", i);
+            let value_other2 = Arc::clone(&value_other);
+            value_other.fetch_or(1 << i, Ordering::SeqCst);
+            ec.fork("proxy").init(move |_| {
+                println!("proxy[{}]", i);
+                value_other2.fetch_xor(1 << i, Ordering::SeqCst);
+            });
+        })
+        .run()
+        .join();
+
+    assert_eq!(value.load(Ordering::Acquire), 0);
 }
