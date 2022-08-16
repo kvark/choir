@@ -19,9 +19,12 @@ name = "ballpark"
 harness = false
 
 [dependencies]
-crossbeam-deque = "0.8"
+crossbeam-deque = { version = "0.8", optional = true }
 log = "0.4"
 profiling = "1"
+
+[target.'cfg(shuttle)'.dependencies]
+shuttle = { git = "https://github.com/awslabs/shuttle" }
 
 [dev-dependencies]
 criterion = "0.3"

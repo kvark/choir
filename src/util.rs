@@ -32,6 +32,7 @@ impl<T> FromIterator<T> for PerTaskData<T> {
     }
 }
 
+#[cfg(not(shuttle))]
 #[test]
 fn smoke() {
     let mut choir = super::Choir::new();

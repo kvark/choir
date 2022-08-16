@@ -35,19 +35,24 @@ Lifetime of a Task:
 
 /// Better shared pointer.
 pub mod arc;
+mod queue;
 /// Additional utilities.
 pub mod util;
 
 use self::arc::Linearc;
-use crossbeam_deque::{Injector, Steal};
-use std::{
-    fmt, mem, ops,
-    sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc, Mutex, RwLock,
-    },
-    thread, time,
+#[cfg(shuttle)]
+use shuttle::{
+    sync::{atomic, Arc, Mutex, RwLock},
+    thread,
 };
+use std::{fmt, mem, ops, time};
+#[cfg(not(shuttle))]
+use std::{
+    sync::{atomic, Arc, Mutex, RwLock},
+    thread,
+};
+
+//TODO: https://github.com/awslabs/shuttle/issues/75
 
 const BITS_PER_BYTE: usize = 8;
 const MAX_WORKERS: usize = mem::size_of::<usize>() * BITS_PER_BYTE;
@@ -137,9 +142,40 @@ struct Task {
     notifier: Arc<Notifier>,
 }
 
+enum Steal {
+    Empty,
+    Full(Task),
+    #[cfg_attr(not(feature = "crossbeam_deque"), allow(unused))]
+    Retry,
+}
+
+trait TaskQueue: Sized {
+    fn new() -> Self;
+    fn gift(&self, task: Task);
+    fn steal(&self) -> Steal;
+    fn is_empty(&self) -> bool;
+}
+
+#[cfg(feature = "crossbeam_deque")]
+impl TaskQueue for crossbeam_deque::Injector<Task> {
+    fn new() -> Self {
+        crossbeam_deque::Injector::new()
+    }
+    fn gift(&self, task: Task) {
+        self.push(task);
+    }
+    fn steal(&self) -> Steal {
+        match crossbeam_deque::Injector::steal(self) {
+            crossbeam_deque::Steal::Empty => Steal::Empty,
+            crossbeam_deque::Steal::Success(task) => Steal::Full(task),
+            crossbeam_deque::Steal::Retry => Steal::Retry,
+        }
+    }
+}
+
 struct Worker {
     name: String,
-    alive: AtomicBool,
+    alive: atomic::AtomicBool,
 }
 
 struct WorkerContext {
@@ -151,16 +187,19 @@ struct WorkerPool {
 }
 
 struct Conductor {
-    injector: Injector<Task>,
+    #[cfg(feature = "crossbeam_deque")]
+    queue: crossbeam_deque::Injector<Task>,
+    #[cfg(not(feature = "crossbeam_deque"))]
+    queue: queue::Queue<Task>,
     workers: RwLock<WorkerPool>,
-    parked_mask: AtomicUsize,
+    parked_mask: atomic::AtomicUsize,
 }
 
 impl Conductor {
     fn schedule(&self, task: Task) {
         log::trace!("Task {} is scheduled", task.notifier);
-        self.injector.push(task);
-        let mask = self.parked_mask.load(Ordering::Acquire);
+        self.queue.gift(task);
+        let mask = self.parked_mask.load(atomic::Ordering::Acquire);
         // Wake up a thread if there is a sleeping one.
         if mask != 0 {
             let index = mask.trailing_zeros() as usize;
@@ -204,9 +243,9 @@ impl Conductor {
                 let middle = (sub_range.end + sub_range.start) >> 1;
                 // split the task if needed
                 if middle != sub_range.start {
-                    let mask = self.parked_mask.load(Ordering::Acquire);
+                    let mask = self.parked_mask.load(atomic::Ordering::Acquire);
                     if mask != 0 {
-                        self.injector.push(Task {
+                        self.queue.gift(Task {
                             functor: Functor::Multi(middle..sub_range.end, Linearc::clone(&fun)),
                             notifier: Arc::clone(&task.notifier),
                         });
@@ -238,7 +277,7 @@ impl Conductor {
                     // Put it back to the queue, with the next sub-index.
                     // Note: we aren't calling `schedule` because we know at least this very thread
                     // will be able to pick it up, so no need to wake up anybody.
-                    self.injector.push(Task {
+                    self.queue.gift(Task {
                         functor: Functor::Multi(sub_range, fun),
                         notifier: task.notifier,
                     });
@@ -289,22 +328,22 @@ impl Conductor {
         };
         log::info!("Thread[{}] = '{}' started", index, worker.name);
 
-        while worker.alive.load(Ordering::Acquire) {
-            match self.injector.steal() {
+        while worker.alive.load(atomic::Ordering::Acquire) {
+            match self.queue.steal() {
                 Steal::Empty => {
                     log::trace!("Thread[{}] sleeps", index);
                     let mask = 1 << index;
-                    self.parked_mask.fetch_or(mask, Ordering::Release);
-                    if self.injector.is_empty() {
+                    self.parked_mask.fetch_or(mask, atomic::Ordering::Release);
+                    if self.queue.is_empty() {
                         // We are on our way to sleep, but there might be
                         // a `schedule()` call running elsewhere,
                         // missing our parked bit.
                         profiling::scope!("park");
                         thread::park();
                     }
-                    self.parked_mask.fetch_and(!mask, Ordering::Release);
+                    self.parked_mask.fetch_and(!mask, atomic::Ordering::Release);
                 }
-                Steal::Success(task) => {
+                Steal::Full(task) => {
                     let notifier_maybe = self.execute(task, index);
                     let mut notifier_ref = notifier_maybe.as_ref();
                     while let Some(notifier) = notifier_ref {
@@ -324,7 +363,7 @@ impl Conductor {
 /// Main structure for managing tasks.
 pub struct Choir {
     conductor: Arc<Conductor>,
-    next_id: AtomicUsize,
+    next_id: atomic::AtomicUsize,
 }
 
 /// Handle object holding a worker thread alive.
@@ -401,7 +440,7 @@ impl AsRef<Notifier> for IdleTask {
 impl Linearc<dyn Fn(ExecutionContext, SubIndex) + Send + Sync + 'static> {
     fn new_unsized(fun: impl Fn(ExecutionContext, SubIndex) + Send + Sync + 'static) -> Self {
         Self::from_inner(Box::new(arc::LinearcInner {
-            ref_count: AtomicUsize::new(1),
+            ref_count: atomic::AtomicUsize::new(1),
             data: fun,
         }))
     }
@@ -545,16 +584,15 @@ impl Choir {
     /// Create a new task system.
     pub fn new() -> Self {
         const NO_WORKER: Option<WorkerContext> = None;
-        let injector = Injector::new();
         Self {
             conductor: Arc::new(Conductor {
-                injector,
+                queue: TaskQueue::new(),
                 workers: RwLock::new(WorkerPool {
                     contexts: [NO_WORKER; MAX_WORKERS],
                 }),
-                parked_mask: AtomicUsize::new(0),
+                parked_mask: atomic::AtomicUsize::new(0),
             }),
-            next_id: AtomicUsize::new(1),
+            next_id: atomic::AtomicUsize::new(1),
         }
     }
 
@@ -565,7 +603,7 @@ impl Choir {
     pub fn add_worker(&mut self, name: &str) -> WorkerHandle {
         let worker = Arc::new(Worker {
             name: name.to_string(),
-            alive: AtomicBool::new(true),
+            alive: atomic::AtomicBool::new(true),
         });
         let conductor = Arc::clone(&self.conductor);
         let worker_clone = Arc::clone(&worker);
@@ -584,7 +622,7 @@ impl Choir {
     /// Spawn a new task.
     #[profiling::function]
     pub fn spawn(&self, name: &str) -> ProtoTask {
-        let id = self.next_id.fetch_add(1, Ordering::AcqRel);
+        let id = self.next_id.fetch_add(1, atomic::Ordering::AcqRel);
         log::trace!("Creating task '{}'@{}", name, id);
 
         ProtoTask {
@@ -601,7 +639,7 @@ impl Choir {
 
 impl Drop for WorkerHandle {
     fn drop(&mut self) {
-        self.worker.alive.store(false, Ordering::Release);
+        self.worker.alive.store(false, atomic::Ordering::Release);
         let handle = self.join_handle.take().unwrap();
         handle.thread().unpark();
         let _ = handle.join();

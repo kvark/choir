@@ -56,3 +56,10 @@ Machine: MBP 2016, 3.3 GHz Dual-Core Intel Core i7
 Executing 100k empty tasks:
 - individually: 28ms
 - as a multi-task: 6ms
+
+## Testing
+
+Shuttle run:
+```bash
+RUSTFLAGS="--cfg shuttle" cargo test >shuttle.txt
+```

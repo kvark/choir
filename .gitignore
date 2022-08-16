@@ -1,4 +1,4 @@
 /target
 Cargo.lock
-
+/shuttle.txt
 .DS_Store
