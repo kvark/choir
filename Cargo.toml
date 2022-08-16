@@ -22,8 +22,12 @@ harness = false
 crossbeam-deque = "0.8"
 log = "0.4"
 profiling = "1"
+rc_event_queue = "0.4"
 
 [dev-dependencies]
 criterion = "0.3"
 env_logger = "0.9"
 num_cpus = "1"
+
+[target.'cfg(loom)'.dev-dependencies]
+loom = { path = "../loom", features = ["checkpoint"] }

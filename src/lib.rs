@@ -38,16 +38,41 @@ pub mod arc;
 /// Additional utilities.
 pub mod util;
 
+#[cfg(loom)]
+use loom::{sync, thread};
+#[cfg(not(loom))]
+use std::{sync, thread};
+
 use self::arc::Linearc;
-use crossbeam_deque::{Injector, Steal};
+//use crossbeam_deque::{Injector, Steal};
 use std::{
     fmt, mem, ops,
-    sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc, Mutex, RwLock,
-    },
-    thread, time,
+    time,
 };
+use self::sync::{
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    Arc, Mutex, RwLock,
+};
+
+use rc_event_queue::mpmc;
+
+enum Steal<T> {
+    Empty,
+    Success<T>,
+    Retry,
+}
+
+
+trait TaskQueue<T> {
+    fn gift(&self, task: T);
+    fn steal(&self) -> Steal<T>;
+}
+
+impl<T> TaskQueue for mpmc::EventQueue<T> {
+    fn gift(&self, task: T) {
+        self.push(task);
+    }
+}
 
 const BITS_PER_BYTE: usize = 8;
 const MAX_WORKERS: usize = mem::size_of::<usize>() * BITS_PER_BYTE;
@@ -206,6 +231,7 @@ impl Conductor {
                 if middle != sub_range.start {
                     let mask = self.parked_mask.load(Ordering::Acquire);
                     if mask != 0 {
+                        profiling::scope!("branch");
                         self.injector.push(Task {
                             functor: Functor::Multi(middle..sub_range.end, Linearc::clone(&fun)),
                             notifier: Arc::clone(&task.notifier),

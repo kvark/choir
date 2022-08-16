@@ -1,13 +1,18 @@
 use std::{
     fmt, mem, ops,
     ptr::NonNull,
-    sync::atomic::{AtomicUsize, Ordering},
 };
+
+#[cfg(loom)]
+use loom::sync::atomic;
+#[cfg(not(loom))]
+use std::sync::atomic;
+
 
 /// Note: `pub(super)` is only needed for a hack
 #[derive(Debug)]
 pub(super) struct LinearcInner<T: ?Sized> {
-    pub(super) ref_count: AtomicUsize,
+    pub(super) ref_count: atomic::AtomicUsize,
     pub(super) data: T,
 }
 
@@ -30,7 +35,7 @@ impl<T> Linearc<T> {
     #[inline]
     pub fn new(data: T) -> Self {
         Self::from_inner(Box::new(LinearcInner {
-            ref_count: AtomicUsize::new(1),
+            ref_count: atomic::AtomicUsize::new(1),
             data,
         }))
     }
@@ -39,7 +44,7 @@ impl<T> Linearc<T> {
     pub fn into_inner(arc: Self) -> Option<T> {
         let count = unsafe { arc.ptr.as_ref() }
             .ref_count
-            .fetch_sub(1, Ordering::AcqRel);
+            .fetch_sub(1, atomic::Ordering::AcqRel);
         if count == 1 {
             let inner = unsafe { Box::from_raw(arc.ptr.as_ptr()) };
             mem::forget(arc);
@@ -70,7 +75,7 @@ impl<T: ?Sized> Linearc<T> {
     pub fn drop_last(arc: Self) -> bool {
         let count = unsafe { arc.ptr.as_ref() }
             .ref_count
-            .fetch_sub(1, Ordering::AcqRel);
+            .fetch_sub(1, atomic::Ordering::AcqRel);
         if count == 1 {
             let _ = unsafe { Box::from_raw(arc.ptr.as_ptr()) };
             mem::forget(arc);
@@ -86,7 +91,7 @@ impl<T: ?Sized> Clone for Linearc<T> {
     fn clone(&self) -> Self {
         unsafe { self.ptr.as_ref() }
             .ref_count
-            .fetch_add(1, Ordering::Release);
+            .fetch_add(1, atomic::Ordering::Release);
         Self { ptr: self.ptr }
     }
 }
@@ -95,7 +100,7 @@ impl<T: ?Sized> Drop for Linearc<T> {
     fn drop(&mut self) {
         let count = unsafe { self.ptr.as_ref() }
             .ref_count
-            .fetch_sub(1, Ordering::AcqRel);
+            .fetch_sub(1, atomic::Ordering::AcqRel);
         if count == 1 {
             let _ = unsafe { Box::from_raw(self.ptr.as_ptr()) };
         }
