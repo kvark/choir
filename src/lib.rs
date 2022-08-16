@@ -38,13 +38,13 @@ pub mod arc;
 /// Additional utilities.
 pub mod util;
 
-#[cfg(feature = "loom")]
+#[cfg(loom)]
 use loom::{sync, thread};
-#[cfg(not(feature = "loom"))]
+#[cfg(not(loom))]
 use std::{sync, thread};
 
 use self::arc::Linearc;
-use crossbeam_deque::{Injector, Steal};
+//use crossbeam_deque::{Injector, Steal};
 use std::{
     fmt, mem, ops,
     time,
@@ -53,6 +53,26 @@ use self::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Mutex, RwLock,
 };
+
+use rc_event_queue::mpmc;
+
+enum Steal<T> {
+    Empty,
+    Success<T>,
+    Retry,
+}
+
+
+trait TaskQueue<T> {
+    fn gift(&self, task: T);
+    fn steal(&self) -> Steal<T>;
+}
+
+impl<T> TaskQueue for mpmc::EventQueue<T> {
+    fn gift(&self, task: T) {
+        self.push(task);
+    }
+}
 
 const BITS_PER_BYTE: usize = 8;
 const MAX_WORKERS: usize = mem::size_of::<usize>() * BITS_PER_BYTE;

@@ -1,9 +1,10 @@
 use super::SubIndex;
-#[cfg(feature = "loom")]
-use loom::cell::UnsafeCell;
-#[cfg(not(feature = "loom"))]
-use std::cell::UnsafeCell;
 use std::iter::FromIterator;
+
+#[cfg(loom)]
+use loom::cell::UnsafeCell;
+#[cfg(not(loom))]
+use std::cell::UnsafeCell;
 
 /// Helper data structure for holding per-task data.
 /// Each element is expected to only be accessed zero or one time.
