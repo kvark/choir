@@ -41,7 +41,9 @@ pub mod util;
 use self::arc::Linearc;
 use crossbeam_deque::{Injector, Steal};
 use std::{
-    fmt, mem, ops,
+    fmt,
+    marker::PhantomData,
+    mem, ops,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex, RwLock,
@@ -80,22 +82,23 @@ pub struct ExecutionContext<'a> {
     notifier: &'a Arc<Notifier>,
 }
 
-impl ExecutionContext<'_> {
+impl<'a> ExecutionContext<'a> {
     /// Fork the current task.
     ///
     /// This is useful because it allows creating tasks on the fly from within
     /// other tasks. Generally, making a task in flight depend on anything is impossible.
     /// But one can fork a dependency instead.
-    pub fn fork(&self, name: &str) -> ProtoTask {
+    pub fn fork(&self, name: &str) -> ProtoTask<'a> {
         log::trace!("Forking task {} as '{}'", self.notifier, name);
         ProtoTask {
-            conductor: self.conductor,
+            conductor: Arc::clone(self.conductor),
             notifier: Notifier {
                 serial_id: self.notifier.serial_id,
                 name: name.to_string(),
                 parent: Some(Arc::clone(self.notifier)),
                 continuation: Mutex::new(Some(Continuation::default())),
             },
+            lifetime: PhantomData,
         }
     }
 }
@@ -103,16 +106,16 @@ impl ExecutionContext<'_> {
 /// Index of a sub-task inside a multi-task.
 pub type SubIndex = u32;
 
-enum Functor {
+enum Functor<'a> {
     Dummy,
-    Once(Box<dyn FnOnce(ExecutionContext) + Send + 'static>),
+    Once(Box<dyn FnOnce(ExecutionContext) + Send + 'a>),
     Multi(
         ops::Range<SubIndex>,
-        Linearc<dyn Fn(ExecutionContext, SubIndex) + Send + Sync + 'static>,
+        Linearc<dyn Fn(ExecutionContext, SubIndex) + Send + Sync + 'a>,
     ),
 }
 
-impl fmt::Debug for Functor {
+impl fmt::Debug for Functor<'_> {
     fn fmt(&self, serializer: &mut fmt::Formatter) -> fmt::Result {
         match *self {
             Self::Dummy => serializer.debug_struct("Dummy").finish(),
@@ -127,12 +130,12 @@ impl fmt::Debug for Functor {
 
 // This is totally safe. See:
 // https://internals.rust-lang.org/t/dyn-fnonce-should-always-be-sync/16470
-unsafe impl Sync for Functor {}
+unsafe impl Sync for Functor<'_> {}
 
 #[derive(Debug)]
 struct Task {
     /// Body of the task.
-    functor: Functor,
+    functor: Functor<'static>,
     /// This notifier is only really shared with `RunningTask`
     notifier: Arc<Notifier>,
 }
@@ -333,13 +336,13 @@ pub struct WorkerHandle {
     join_handle: Option<thread::JoinHandle<()>>,
 }
 
-enum MaybeArc<T> {
+enum MaybeShared<T> {
     Unique(T),
     Shared(Linearc<T>),
     Null,
 }
 
-impl<T> MaybeArc<T> {
+impl<T> MaybeShared<T> {
     const NULL_ERROR: &'static str = "Value is gone!";
 
     fn new(value: T) -> Self {
@@ -377,16 +380,17 @@ impl<T> MaybeArc<T> {
 }
 
 /// Task construct without any functional logic.
-pub struct ProtoTask<'c> {
-    conductor: &'c Arc<Conductor>,
+pub struct ProtoTask<'a> {
+    conductor: Arc<Conductor>,
     notifier: Notifier,
+    lifetime: PhantomData<&'a ()>,
 }
 
 /// Task that is created but not running yet.
 /// It will be scheduled on `run()` or on drop.
 pub struct IdleTask {
     conductor: Arc<Conductor>,
-    task: MaybeArc<Task>,
+    task: MaybeShared<Task>,
 }
 
 impl AsRef<Notifier> for IdleTask {
@@ -398,8 +402,8 @@ impl AsRef<Notifier> for IdleTask {
 //HACK: turns out, it's impossible to re-implement `Arc` in Rust stable userspace,
 // Because `Arc` relies on `trait Unsized` and `std::ops::CoerceUnsized`, which
 // are still nightly-only behind a feature.
-impl Linearc<dyn Fn(ExecutionContext, SubIndex) + Send + Sync + 'static> {
-    fn new_unsized(fun: impl Fn(ExecutionContext, SubIndex) + Send + Sync + 'static) -> Self {
+impl<'a> Linearc<dyn Fn(ExecutionContext, SubIndex) + Send + Sync + 'a> {
+    fn new_unsized(fun: impl Fn(ExecutionContext, SubIndex) + Send + Sync + 'a) -> Self {
         Self::from_inner(Box::new(arc::LinearcInner {
             ref_count: AtomicUsize::new(1),
             data: fun,
@@ -407,8 +411,8 @@ impl Linearc<dyn Fn(ExecutionContext, SubIndex) + Send + Sync + 'static> {
     }
 }
 
-impl ProtoTask<'_> {
-    fn fill(self, functor: Functor) -> IdleTask {
+impl<'a> ProtoTask<'a> {
+    fn fill(self, functor_constrained: Functor<'a>) -> IdleTask {
         // Only register the fork here, so that nothing happens if a `ProtoTask` is dropped.
         if let Some(ref parent_notifier) = self.notifier.parent {
             parent_notifier
@@ -420,9 +424,12 @@ impl ProtoTask<'_> {
                 .forks += 1;
         }
         IdleTask {
-            conductor: Arc::clone(self.conductor),
-            task: MaybeArc::new(Task {
-                functor,
+            conductor: self.conductor,
+            task: MaybeShared::new(Task {
+                // We are only transmuting the lifetime, and only
+                // because the run time guarantees that the task is not going
+                // to live longer than this lifetime.
+                functor: unsafe { mem::transmute(functor_constrained) },
                 notifier: Arc::new(self.notifier),
             }),
         }
@@ -439,14 +446,14 @@ impl ProtoTask<'_> {
     /// Init task to execute a standalone function.
     /// The function body will be executed once the task is scheduled,
     /// and all of its dependencies are fulfulled.
-    pub fn init<F: FnOnce(ExecutionContext) + Send + 'static>(self, fun: F) -> IdleTask {
+    pub fn init<F: FnOnce(ExecutionContext) + Send + 'a>(self, fun: F) -> IdleTask {
         self.fill(Functor::Once(Box::new(fun)))
     }
 
     /// Init task to execute a function multiple times.
     /// Every invocation is given an index in 0..count
     /// There are no ordering guarantees between the indices.
-    pub fn init_multi<F: Fn(ExecutionContext, SubIndex) + Send + Sync + 'static>(
+    pub fn init_multi<F: Fn(ExecutionContext, SubIndex) + Send + Sync + 'a>(
         self,
         count: SubIndex,
         fun: F,
@@ -464,8 +471,8 @@ impl ProtoTask<'_> {
     pub fn init_iter<I, F>(self, iter: I, fun: F) -> IdleTask
     where
         I: Iterator,
-        I::Item: Send + 'static,
-        F: Fn(I::Item) + Send + Sync + 'static,
+        I::Item: Send + 'a,
+        F: Fn(I::Item) + Send + Sync + 'a,
     {
         let task_data = iter.collect::<util::PerTaskData<_>>();
         self.init_multi(task_data.len(), move |_, index| unsafe {
@@ -583,18 +590,19 @@ impl Choir {
 
     /// Spawn a new task.
     #[profiling::function]
-    pub fn spawn(&self, name: &str) -> ProtoTask {
+    pub fn spawn(&self, name: &str) -> ProtoTask<'static> {
         let id = self.next_id.fetch_add(1, Ordering::AcqRel);
         log::trace!("Creating task '{}'@{}", name, id);
 
         ProtoTask {
-            conductor: &self.conductor,
+            conductor: Arc::clone(&self.conductor),
             notifier: Notifier {
                 serial_id: id,
                 name: name.to_string(),
                 parent: None,
                 continuation: Mutex::new(Some(Continuation::default())),
             },
+            lifetime: PhantomData,
         }
     }
 }
