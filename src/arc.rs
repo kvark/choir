@@ -25,32 +25,6 @@ pub struct Linearc<T: ?Sized> {
 unsafe impl<T: ?Sized> Send for Linearc<T> {}
 unsafe impl<T: ?Sized> Sync for Linearc<T> {}
 
-impl<T> Linearc<T> {
-    /// Create a new pointer from data.
-    #[inline]
-    pub fn new(data: T) -> Self {
-        Self::from_inner(Box::new(LinearcInner {
-            ref_count: AtomicUsize::new(1),
-            data,
-        }))
-    }
-
-    /// Move out the value of this pointer if it's the last instance.
-    pub fn into_inner(arc: Self) -> Option<T> {
-        let count = unsafe { arc.ptr.as_ref() }
-            .ref_count
-            .fetch_sub(1, Ordering::AcqRel);
-        if count == 1 {
-            let inner = unsafe { Box::from_raw(arc.ptr.as_ptr()) };
-            mem::forget(arc);
-            Some((*inner).data)
-        } else {
-            mem::forget(arc);
-            None
-        }
-    }
-}
-
 impl<T: ?Sized> Linearc<T> {
     #[inline]
     pub(super) fn from_inner(inner: Box<LinearcInner<T>>) -> Self {
@@ -65,20 +39,40 @@ impl<T: ?Sized> Linearc<T> {
         arc.clone()
     }
 
-    /// Drop a pointer and return true if this was the last instance.
-    #[inline]
-    pub fn drop_last(arc: Self) -> bool {
+    fn into_box(arc: Self) -> Option<Box<LinearcInner<T>>> {
         let count = unsafe { arc.ptr.as_ref() }
             .ref_count
             .fetch_sub(1, Ordering::AcqRel);
         if count == 1 {
-            let _ = unsafe { Box::from_raw(arc.ptr.as_ptr()) };
+            let inner = unsafe { Box::from_raw(arc.ptr.as_ptr()) };
             mem::forget(arc);
-            true
+            Some(inner)
         } else {
             mem::forget(arc);
-            false
+            None
         }
+    }
+
+    /// Drop a pointer and return true if this was the last instance.
+    #[inline]
+    pub fn drop_last(arc: Self) -> bool {
+        Linearc::into_box(arc).is_some()
+    }
+}
+
+impl<T> Linearc<T> {
+    /// Create a new pointer from data.
+    #[inline]
+    pub fn new(data: T) -> Self {
+        Self::from_inner(Box::new(LinearcInner {
+            ref_count: AtomicUsize::new(1),
+            data,
+        }))
+    }
+
+    /// Move out the value of this pointer if it's the last instance.
+    pub fn into_inner(arc: Self) -> Option<T> {
+        Linearc::into_box(arc).map(|inner| inner.data)
     }
 }
 
