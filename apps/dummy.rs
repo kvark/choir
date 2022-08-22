@@ -8,5 +8,5 @@ fn main() {
         let task = choir.spawn("").init_dummy();
         end.depend_on(&task);
     }
-    end.run().join();
+    end.run_attached();
 }

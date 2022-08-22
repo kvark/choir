@@ -1,16 +1,7 @@
 use rand::Rng as _;
-use std::{ptr, slice};
+use std::{mem, ptr};
 
 type Value = i64;
-
-#[derive(Clone, Copy)]
-struct Array {
-    ptr: *mut Value,
-    count: usize,
-}
-
-// Not sure why Rust doesn't consider pointers movable?
-unsafe impl Send for Array {}
 
 fn insertion_sort(data: &mut [Value]) {
     for i in 1..data.len() {
@@ -29,51 +20,47 @@ fn insertion_sort(data: &mut [Value]) {
     }
 }
 
-unsafe fn split(data: Array) -> (usize, usize) {
-    let mid = *data.ptr;
+fn split(data: &mut [Value]) -> (&mut [Value], &mut [Value]) {
+    let mid = data[0];
     let mut i = 1;
-    let mut j = data.count - 1;
+    let mut j = data.len() - 1;
     'outer: while i < j {
-        while *data.ptr.add(i) <= mid {
+        while data[i] <= mid {
             i += 1;
             if i == j {
                 break 'outer;
             }
         }
-        while *data.ptr.add(j) > mid {
+        while data[j] > mid {
             j -= 1;
             if i == j {
                 break 'outer;
             }
         }
-        ptr::swap(&mut *data.ptr.add(i), &mut *data.ptr.add(j));
+        unsafe {
+            ptr::swap(&mut data[i], &mut data[j]);
+        }
         i += 1;
         j -= 1;
     }
+
+    let (left, right) = data.split_at_mut(j);
     // guarantee that the element in the middle can be excluded
-    if *data.ptr.add(j) <= mid {
-        ptr::swap(&mut *data.ptr, &mut *data.ptr.add(j));
-        (j, j + 1)
+    if right[0] <= mid {
+        mem::swap(&mut left[0], &mut right[0]);
+        (left, right.split_first_mut().unwrap().1)
     } else {
-        (j, j)
+        (left, right)
     }
 }
 
-unsafe fn qsort(data: Array, context: choir::ExecutionContext) {
-    if data.count > 5 {
-        let (left_end, right_start) = split(data);
-        let left = Array {
-            ptr: data.ptr,
-            count: left_end,
-        };
-        let right = Array {
-            ptr: data.ptr.add(right_start),
-            count: data.count - right_start,
-        };
+fn qsort(data: &mut [Value], context: choir::ExecutionContext) {
+    if data.len() > 5 {
+        let (left, right) = split(data);
         context.fork("left").init(move |ec| qsort(left, ec));
         context.fork("right").init(move |ec| qsort(right, ec));
-    } else if data.count > 1 {
-        insertion_sort(slice::from_raw_parts_mut(data.ptr, data.count))
+    } else if data.len() > 1 {
+        insertion_sort(data)
     }
 }
 
@@ -88,18 +75,14 @@ fn main() {
     };
 
     if USE_TASKS {
-        let data_raw = Array {
-            ptr: data.as_mut_ptr(),
-            count: COUNT,
-        };
         let mut choir = choir::Choir::new();
         let _worker1 = choir.add_worker("worker1");
         let _worker2 = choir.add_worker("worker2");
+        let data_slice = data.as_mut_slice();
         choir
             .spawn("main")
-            .init(move |ec| unsafe { qsort(data_raw, ec) })
-            .run()
-            .join();
+            .init(move |ec| qsort(data_slice, ec))
+            .run_attached();
     } else {
         insertion_sort(&mut data);
     }
