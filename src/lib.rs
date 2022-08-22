@@ -62,7 +62,6 @@ struct Continuation {
 /// An object responsible to notify follow-up tasks.
 #[derive(Debug)]
 pub struct Notifier {
-    serial_id: usize,
     name: String,
     parent: Option<Arc<Notifier>>,
     continuation: Mutex<Option<Continuation>>,
@@ -70,7 +69,7 @@ pub struct Notifier {
 
 impl fmt::Display for Notifier {
     fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-        write!(formatter, "'{}'@{}", self.name, self.serial_id)
+        write!(formatter, "'{}'", self.name)
     }
 }
 
@@ -86,13 +85,12 @@ impl ExecutionContext<'_> {
     /// This is useful because it allows creating tasks on the fly from within
     /// other tasks. Generally, making a task in flight depend on anything is impossible.
     /// But one can fork a dependency instead.
-    pub fn fork(&self, name: &str) -> ProtoTask {
+    pub fn fork(&self, name: impl fmt::Display) -> ProtoTask {
         log::trace!("Forking task {} as '{}'", self.notifier, name);
         ProtoTask {
             conductor: self.conductor,
             notifier: Notifier {
-                serial_id: self.notifier.serial_id,
-                name: name.to_string(),
+                name: format!("{}/{}", self.notifier.name, name),
                 parent: Some(Arc::clone(self.notifier)),
                 continuation: Mutex::new(Some(Continuation::default())),
             },
@@ -248,7 +246,7 @@ impl Conductor {
         }
     }
 
-    fn finish(&self, notifier: &Notifier) {
+    fn finish<'a>(&self, notifier: &'a Notifier) -> Option<&'a Arc<Notifier>> {
         profiling::scope!("unblock");
         // mark the task as done
         log::trace!("Finishing task {}", notifier);
@@ -257,8 +255,9 @@ impl Conductor {
             let mut guard = notifier.continuation.lock().unwrap();
             if let Some(ref mut cont) = *guard {
                 if cont.forks != 0 {
+                    log::trace!("\t{} forks are still alive", cont.forks);
                     cont.forks -= 1;
-                    return;
+                    return None;
                 }
             }
             guard.take().unwrap()
@@ -275,6 +274,8 @@ impl Conductor {
                 self.schedule(ready);
             }
         }
+
+        notifier.parent.as_ref()
     }
 
     fn work_loop(self: &Arc<Self>, worker: &Worker) {
@@ -308,8 +309,7 @@ impl Conductor {
                     let notifier_maybe = self.execute(task, index);
                     let mut notifier_ref = notifier_maybe.as_ref();
                     while let Some(notifier) = notifier_ref {
-                        self.finish(notifier);
-                        notifier_ref = notifier.parent.as_ref();
+                        notifier_ref = self.finish(notifier);
                     }
                 }
                 Steal::Retry => {}
@@ -384,12 +384,15 @@ pub struct ProtoTask<'c> {
 
 /// Task that is created but not running yet.
 /// It will be scheduled on `run()` or on drop.
-pub struct IdleTask {
+/// The 'a lifetime is responsible for the data
+/// in the closure of the task function.
+pub struct IdleTask<'a> {
     conductor: Arc<Conductor>,
     task: MaybeArc<Task>,
+    _lifetime: &'a (),
 }
 
-impl AsRef<Notifier> for IdleTask {
+impl AsRef<Notifier> for IdleTask<'_> {
     fn as_ref(&self) -> &Notifier {
         &self.task.as_ref().notifier
     }
@@ -398,8 +401,8 @@ impl AsRef<Notifier> for IdleTask {
 //HACK: turns out, it's impossible to re-implement `Arc` in Rust stable userspace,
 // Because `Arc` relies on `trait Unsized` and `std::ops::CoerceUnsized`, which
 // are still nightly-only behind a feature.
-impl Linearc<dyn Fn(ExecutionContext, SubIndex) + Send + Sync + 'static> {
-    fn new_unsized(fun: impl Fn(ExecutionContext, SubIndex) + Send + Sync + 'static) -> Self {
+impl<'a> Linearc<dyn Fn(ExecutionContext, SubIndex) + Send + Sync + 'a> {
+    fn new_unsized(fun: impl Fn(ExecutionContext, SubIndex) + Send + Sync + 'a) -> Self {
         Self::from_inner(Box::new(arc::LinearcInner {
             ref_count: AtomicUsize::new(1),
             data: fun,
@@ -408,7 +411,7 @@ impl Linearc<dyn Fn(ExecutionContext, SubIndex) + Send + Sync + 'static> {
 }
 
 impl ProtoTask<'_> {
-    fn fill(self, functor: Functor) -> IdleTask {
+    fn fill<'a>(self, functor: Functor) -> IdleTask<'a> {
         // Only register the fork here, so that nothing happens if a `ProtoTask` is dropped.
         if let Some(ref parent_notifier) = self.notifier.parent {
             parent_notifier
@@ -425,6 +428,7 @@ impl ProtoTask<'_> {
                 functor,
                 notifier: Arc::new(self.notifier),
             }),
+            _lifetime: &(),
         }
     }
 
@@ -432,40 +436,43 @@ impl ProtoTask<'_> {
     /// Can be useful to aggregate dependencies, for example
     /// if a function returns a task handle, and it launches
     /// multiple sub-tasks in parallel.
-    pub fn init_dummy(self) -> IdleTask {
+    pub fn init_dummy(self) -> IdleTask<'static> {
         self.fill(Functor::Dummy)
     }
 
     /// Init task to execute a standalone function.
     /// The function body will be executed once the task is scheduled,
     /// and all of its dependencies are fulfulled.
-    pub fn init<F: FnOnce(ExecutionContext) + Send + 'static>(self, fun: F) -> IdleTask {
-        self.fill(Functor::Once(Box::new(fun)))
+    pub fn init<'a, F: FnOnce(ExecutionContext) + Send + 'a>(self, fun: F) -> IdleTask<'a> {
+        let b: Box<dyn FnOnce(ExecutionContext) + Send + 'a> = Box::new(fun);
+        self.fill(Functor::Once(unsafe { mem::transmute(b) }))
     }
 
     /// Init task to execute a function multiple times.
     /// Every invocation is given an index in 0..count
     /// There are no ordering guarantees between the indices.
-    pub fn init_multi<F: Fn(ExecutionContext, SubIndex) + Send + Sync + 'static>(
+    pub fn init_multi<'a, F: Fn(ExecutionContext, SubIndex) + Send + Sync + 'a>(
         self,
         count: SubIndex,
         fun: F,
-    ) -> IdleTask {
+    ) -> IdleTask<'a> {
         self.fill(if count == 0 {
             Functor::Dummy
         } else {
-            Functor::Multi(0..count, Linearc::new_unsized(fun))
+            let arc: Linearc<dyn Fn(ExecutionContext, SubIndex) + Send + Sync + 'a> =
+                Linearc::new_unsized(fun);
+            Functor::Multi(0..count, unsafe { mem::transmute(arc) })
         })
     }
 
     /// Init task to execute a function on each element of a finite iterator.
     /// Similarly to `init_multi`, each invocation is executed
     /// indepdently and can be out of order.
-    pub fn init_iter<I, F>(self, iter: I, fun: F) -> IdleTask
+    pub fn init_iter<'a, I, F>(self, iter: I, fun: F) -> IdleTask<'a>
     where
         I: Iterator,
-        I::Item: Send + 'static,
-        F: Fn(I::Item) + Send + Sync + 'static,
+        I::Item: Send + 'a,
+        F: Fn(I::Item) + Send + Sync + 'a,
     {
         let task_data = iter.collect::<util::PerTaskData<_>>();
         self.init_multi(task_data.len(), move |_, index| unsafe {
@@ -583,15 +590,15 @@ impl Choir {
 
     /// Spawn a new task.
     #[profiling::function]
-    pub fn spawn(&self, name: &str) -> ProtoTask {
+    pub fn spawn(&self, given_name: impl fmt::Display) -> ProtoTask {
         let id = self.next_id.fetch_add(1, Ordering::AcqRel);
-        log::trace!("Creating task '{}'@{}", name, id);
+        let name = format!("{}-{}", given_name, id);
+        log::trace!("Creating task '{}", name);
 
         ProtoTask {
             conductor: &self.conductor,
             notifier: Notifier {
-                serial_id: id,
-                name: name.to_string(),
+                name,
                 parent: None,
                 continuation: Mutex::new(Some(Continuation::default())),
             },
@@ -608,7 +615,7 @@ impl Drop for WorkerHandle {
     }
 }
 
-impl IdleTask {
+impl IdleTask<'static> {
     /// Schedule this task for running.
     ///
     /// It will only be executed once the dependencies are fulfilled.
@@ -617,6 +624,25 @@ impl IdleTask {
         RunningTask {
             notifier: Arc::clone(&task.notifier),
         }
+    }
+}
+
+impl<'a> IdleTask<'a> {
+    fn kick(&mut self) {
+        if let Some(ready) = self.task.extract() {
+            self.conductor.schedule(ready);
+        }
+    }
+
+    /// Run the task now and block until it's executed.
+    /// Use the current thread to help the choir in the meantime.
+    pub fn run_attached(mut self) {
+        let task = self.task.as_ref();
+        let running = RunningTask {
+            notifier: Arc::clone(&task.notifier),
+        };
+        self.kick();
+        running.join();
     }
 
     /// Add a dependency on another task, which is possibly running.
@@ -627,10 +653,8 @@ impl IdleTask {
     }
 }
 
-impl Drop for IdleTask {
+impl Drop for IdleTask<'_> {
     fn drop(&mut self) {
-        if let Some(ready) = self.task.extract() {
-            self.conductor.schedule(ready);
-        }
+        self.kick();
     }
 }
