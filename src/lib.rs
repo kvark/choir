@@ -232,7 +232,7 @@ impl Choir {
         self.wake_up_one();
     }
 
-    fn execute(self: &Arc<Self>, task: Task, worker_index: usize) -> Option<Arc<Notifier>> {
+    fn execute(self: &Arc<Self>, task: Task, worker_index: isize) {
         let execontext = ExecutionContext {
             choir: self,
             notifier: &task.notifier,
@@ -244,13 +244,11 @@ impl Choir {
                     task.notifier,
                     worker_index
                 );
-                Some(task.notifier)
             }
             Functor::Once(fun) => {
                 log::debug!("Task {} runs on thread[{}]", task.notifier, worker_index);
                 profiling::scope!("execute");
                 (fun)(execontext);
-                Some(task.notifier)
             }
             Functor::Multi(mut sub_range, fun) => {
                 log::debug!(
@@ -288,10 +286,8 @@ impl Choir {
                 // are we done yet?
                 sub_range.start += 1;
                 if sub_range.start == sub_range.end {
-                    if Linearc::drop_last(fun) {
-                        Some(task.notifier)
-                    } else {
-                        None
+                    if !Linearc::drop_last(fun) {
+                        return;
                     }
                 } else {
                     // Put it back to the queue, with the next sub-index.
@@ -301,9 +297,14 @@ impl Choir {
                         functor: Functor::Multi(sub_range, fun),
                         notifier: task.notifier,
                     });
-                    None
+                    return;
                 }
             }
+        }
+
+        let mut notifier_ref = Some(&task.notifier);
+        while let Some(notifier) = notifier_ref {
+            notifier_ref = self.finish(notifier);
         }
     }
 
@@ -373,11 +374,7 @@ impl Choir {
                 self.parked_mask.fetch_and(!mask, Ordering::Release);
             }
             Steal::Success(task) => {
-                let notifier_maybe = self.execute(task, index);
-                let mut notifier_ref = notifier_maybe.as_ref();
-                while let Some(notifier) = notifier_ref {
-                    notifier_ref = self.finish(notifier);
-                }
+                self.execute(task, index as isize);
             }
             Steal::Retry => {}
         }
@@ -671,22 +668,23 @@ impl IdleTask<'static> {
 }
 
 impl<'a> IdleTask<'a> {
-    fn kick(&mut self) {
-        if let Some(ready) = self.task.extract() {
-            self.choir.schedule(ready);
-        }
-    }
-
     /// Run the task now and block until it's executed.
     /// Use the current thread to help the choir in the meantime.
     pub fn run_attached(mut self) {
         let task = self.task.as_ref();
-        let running = RunningTask {
-            choir: Arc::clone(&self.choir),
-            notifier: Arc::clone(&task.notifier),
-        };
-        self.kick();
-        running.join_active();
+        let notifier = Arc::clone(&task.notifier);
+
+        if let Some(ready) = self.task.extract() {
+            // Task has no dependencies. No need to join the pool,
+            // just execute it right here instead.
+            self.choir.execute(ready, -1);
+        } else {
+            RunningTask {
+                choir: Arc::clone(&self.choir),
+                notifier,
+            }
+            .join_active();
+        }
     }
 
     /// Add a dependency on another task, which is possibly running.
@@ -699,6 +697,8 @@ impl<'a> IdleTask<'a> {
 
 impl Drop for IdleTask<'_> {
     fn drop(&mut self) {
-        self.kick();
+        if let Some(ready) = self.task.extract() {
+            self.choir.schedule(ready);
+        }
     }
 }
