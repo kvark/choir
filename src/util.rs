@@ -34,9 +34,7 @@ impl<T> FromIterator<T> for PerTaskData<T> {
 
 #[test]
 fn smoke() {
-    let mut choir = super::Choir::new();
-    let _worker1 = choir.add_worker("P1");
-
+    let choir = super::Choir::new();
     let data: PerTaskData<u32> = (0..10).collect();
     choir
         .spawn("")
@@ -44,6 +42,5 @@ fn smoke() {
             let v = unsafe { data.take(i) };
             println!("v = {}", v);
         })
-        .run()
-        .join();
+        .run_attached();
 }
