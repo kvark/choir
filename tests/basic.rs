@@ -1,12 +1,16 @@
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc, Mutex,
+use std::{
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
+    thread,
+    time::Duration,
 };
 
 #[test]
 fn parallel() {
     let _ = env_logger::try_init();
-    let mut choir = choir::Choir::new();
+    let choir = choir::Choir::new();
     let _worker1 = choir.add_worker("P1");
     let _worker2 = choir.add_worker("P2");
 
@@ -33,7 +37,7 @@ fn parallel() {
 #[test]
 fn sequential() {
     let _ = env_logger::try_init();
-    let mut choir = choir::Choir::new();
+    let choir = choir::Choir::new();
     let _worker = choir.add_worker("S");
 
     let value = Arc::new(Mutex::new(0));
@@ -58,7 +62,7 @@ fn sequential() {
 
 #[test]
 fn zero_count() {
-    let mut choir = choir::Choir::new();
+    let choir = choir::Choir::new();
     let _worker1 = choir.add_worker("A");
     choir.spawn("").init_multi(0, |_, _| {}).run().join();
 }
@@ -66,7 +70,7 @@ fn zero_count() {
 #[test]
 fn multi_sum() {
     let _ = env_logger::try_init();
-    let mut choir = choir::Choir::new();
+    let choir = choir::Choir::new();
     let _worker1 = choir.add_worker("A");
     let _worker2 = choir.add_worker("B");
 
@@ -86,7 +90,7 @@ fn multi_sum() {
 #[test]
 fn iter_xor() {
     let _ = env_logger::try_init();
-    let mut choir = choir::Choir::new();
+    let choir = choir::Choir::new();
     let _worker1 = choir.add_worker("A");
     let _worker2 = choir.add_worker("B");
 
@@ -107,7 +111,7 @@ fn iter_xor() {
 #[test]
 fn proxy() {
     let _ = env_logger::try_init();
-    let mut choir = choir::Choir::new();
+    let choir = choir::Choir::new();
     let _worker1 = choir.add_worker("A");
     let _worker2 = choir.add_worker("B");
 
@@ -129,4 +133,36 @@ fn proxy() {
         .join();
 
     assert_eq!(value.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn unhelpful() {
+    let choir = choir::Choir::new();
+    let mut done = false;
+    choir
+        .spawn("task")
+        .init(|_| {
+            done = true;
+        })
+        .run_attached();
+    assert!(done);
+}
+
+#[test]
+fn multi_thread_join() {
+    let _ = env_logger::try_init();
+    let choir = choir::Choir::new();
+    let _w = choir.add_worker("main");
+    let running = choir
+        .spawn("task")
+        .init(|_| {
+            thread::sleep(Duration::from_millis(100));
+        })
+        .run();
+    let r1 = running.clone();
+    let t1 = thread::spawn(|| r1.join());
+    let r2 = running.clone();
+    let t2 = thread::spawn(|| r2.join());
+    t1.join().unwrap();
+    t2.join().unwrap();
 }

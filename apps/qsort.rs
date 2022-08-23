@@ -75,7 +75,7 @@ fn main() {
     };
 
     if USE_TASKS {
-        let mut choir = choir::Choir::new();
+        let choir = choir::Choir::new();
         let _worker1 = choir.add_worker("worker1");
         let _worker2 = choir.add_worker("worker2");
         let data_slice = data.as_mut_slice();

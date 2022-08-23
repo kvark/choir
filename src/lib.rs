@@ -75,7 +75,7 @@ impl fmt::Display for Notifier {
 
 /// Context of a task execution body.
 pub struct ExecutionContext<'a> {
-    conductor: &'a Arc<Conductor>,
+    choir: &'a Arc<Choir>,
     notifier: &'a Arc<Notifier>,
 }
 
@@ -88,7 +88,7 @@ impl ExecutionContext<'_> {
     pub fn fork(&self, name: impl fmt::Display) -> ProtoTask {
         log::trace!("Forking task {} as '{}'", self.notifier, name);
         ProtoTask {
-            conductor: self.conductor,
+            choir: self.choir,
             notifier: Notifier {
                 name: format!("{}/{}", self.notifier.name, name),
                 parent: Some(Arc::clone(self.notifier)),
@@ -148,16 +148,71 @@ struct WorkerPool {
     contexts: [Option<WorkerContext>; MAX_WORKERS],
 }
 
-struct Conductor {
+/// Main structure for managing tasks.
+pub struct Choir {
     injector: Injector<Task>,
     workers: RwLock<WorkerPool>,
     parked_mask: AtomicUsize,
 }
 
-impl Conductor {
-    fn schedule(&self, task: Task) {
-        log::trace!("Task {} is scheduled", task.notifier);
-        self.injector.push(task);
+impl Default for Choir {
+    fn default() -> Self {
+        const NO_WORKER: Option<WorkerContext> = None;
+        let injector = Injector::new();
+        Self {
+            injector,
+            workers: RwLock::new(WorkerPool {
+                contexts: [NO_WORKER; MAX_WORKERS],
+            }),
+            parked_mask: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl Choir {
+    /// Create a new task system.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Add a new worker thread.
+    ///
+    /// Note: A system can't have more than `MAX_WORKERS` workers
+    /// enabled at any time.
+    pub fn add_worker(self: &Arc<Self>, name: &str) -> WorkerHandle {
+        let worker = Arc::new(Worker {
+            name: name.to_string(),
+            alive: AtomicBool::new(true),
+        });
+        let choir = Arc::clone(self);
+        let worker_clone = Arc::clone(&worker);
+
+        let join_handle = thread::Builder::new()
+            .name(name.to_string())
+            .spawn(move || choir.work_loop(&worker_clone))
+            .unwrap();
+
+        WorkerHandle {
+            worker,
+            join_handle: Some(join_handle),
+        }
+    }
+
+    /// Spawn a new task.
+    #[profiling::function]
+    pub fn spawn<'a>(self: &'a Arc<Self>, name: impl fmt::Display) -> ProtoTask<'a> {
+        log::trace!("Creating task '{}", name);
+        ProtoTask {
+            choir: self,
+            notifier: Notifier {
+                name: format!("{}", name),
+                parent: None,
+                continuation: Mutex::new(Some(Continuation::default())),
+            },
+        }
+    }
+
+    fn wake_up_one(&self) {
         let mask = self.parked_mask.load(Ordering::Acquire);
         // Wake up a thread if there is a sleeping one.
         if mask != 0 {
@@ -171,9 +226,15 @@ impl Conductor {
         }
     }
 
+    fn schedule(&self, task: Task) {
+        log::trace!("Task {} is scheduled", task.notifier);
+        self.injector.push(task);
+        self.wake_up_one();
+    }
+
     fn execute(self: &Arc<Self>, task: Task, worker_index: usize) -> Option<Arc<Notifier>> {
         let execontext = ExecutionContext {
-            conductor: self,
+            choir: self,
             notifier: &task.notifier,
         };
         match task.functor {
@@ -278,53 +339,62 @@ impl Conductor {
         notifier.parent.as_ref()
     }
 
+    fn register(&self) -> Option<usize> {
+        let mut pool = self.workers.write().unwrap();
+        let index = pool.contexts.iter_mut().position(|c| c.is_none())?;
+        pool.contexts[index] = Some(WorkerContext {
+            thread: thread::current(),
+        });
+        Some(index)
+    }
+
+    fn unregister(&self, index: usize) {
+        self.workers.write().unwrap().contexts[index] = None;
+        // Avoid a situation where choir is expecting this thread
+        // to help with more tasks.
+        if !self.injector.is_empty() {
+            self.wake_up_one();
+        }
+    }
+
+    fn work(self: &Arc<Self>, index: usize) {
+        match self.injector.steal() {
+            Steal::Empty => {
+                log::trace!("Thread[{}] sleeps", index);
+                let mask = 1 << index;
+                self.parked_mask.fetch_or(mask, Ordering::Release);
+                if self.injector.is_empty() {
+                    // We are on our way to sleep, but there might be
+                    // a `schedule()` call running elsewhere,
+                    // missing our parked bit.
+                    profiling::scope!("park");
+                    thread::park();
+                }
+                self.parked_mask.fetch_and(!mask, Ordering::Release);
+            }
+            Steal::Success(task) => {
+                let notifier_maybe = self.execute(task, index);
+                let mut notifier_ref = notifier_maybe.as_ref();
+                while let Some(notifier) = notifier_ref {
+                    notifier_ref = self.finish(notifier);
+                }
+            }
+            Steal::Retry => {}
+        }
+    }
+
     fn work_loop(self: &Arc<Self>, worker: &Worker) {
         profiling::register_thread!();
-        let index = {
-            let mut pool = self.workers.write().unwrap();
-            let index = pool.contexts.iter_mut().position(|c| c.is_none()).unwrap();
-            pool.contexts[index] = Some(WorkerContext {
-                thread: thread::current(),
-            });
-            index
-        };
+        let index = self.register().unwrap();
         log::info!("Thread[{}] = '{}' started", index, worker.name);
 
         while worker.alive.load(Ordering::Acquire) {
-            match self.injector.steal() {
-                Steal::Empty => {
-                    log::trace!("Thread[{}] sleeps", index);
-                    let mask = 1 << index;
-                    self.parked_mask.fetch_or(mask, Ordering::Release);
-                    if self.injector.is_empty() {
-                        // We are on our way to sleep, but there might be
-                        // a `schedule()` call running elsewhere,
-                        // missing our parked bit.
-                        profiling::scope!("park");
-                        thread::park();
-                    }
-                    self.parked_mask.fetch_and(!mask, Ordering::Release);
-                }
-                Steal::Success(task) => {
-                    let notifier_maybe = self.execute(task, index);
-                    let mut notifier_ref = notifier_maybe.as_ref();
-                    while let Some(notifier) = notifier_ref {
-                        notifier_ref = self.finish(notifier);
-                    }
-                }
-                Steal::Retry => {}
-            }
+            self.work(index);
         }
 
         log::info!("Thread '{}' dies", worker.name);
-        self.workers.write().unwrap().contexts[index] = None;
+        self.unregister(index);
     }
-}
-
-/// Main structure for managing tasks.
-pub struct Choir {
-    conductor: Arc<Conductor>,
-    next_id: AtomicUsize,
 }
 
 /// Handle object holding a worker thread alive.
@@ -378,7 +448,7 @@ impl<T> MaybeArc<T> {
 
 /// Task construct without any functional logic.
 pub struct ProtoTask<'c> {
-    conductor: &'c Arc<Conductor>,
+    choir: &'c Arc<Choir>,
     notifier: Notifier,
 }
 
@@ -387,7 +457,7 @@ pub struct ProtoTask<'c> {
 /// The 'a lifetime is responsible for the data
 /// in the closure of the task function.
 pub struct IdleTask<'a> {
-    conductor: Arc<Conductor>,
+    choir: Arc<Choir>,
     task: MaybeArc<Task>,
     _lifetime: &'a (),
 }
@@ -423,7 +493,7 @@ impl ProtoTask<'_> {
                 .forks += 1;
         }
         IdleTask {
-            conductor: Arc::clone(self.conductor),
+            choir: Arc::clone(self.choir),
             task: MaybeArc::new(Task {
                 functor,
                 notifier: Arc::new(self.notifier),
@@ -482,9 +552,16 @@ impl ProtoTask<'_> {
 }
 
 /// Task that is already scheduled for running.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct RunningTask {
+    choir: Arc<Choir>,
     notifier: Arc<Notifier>,
+}
+
+impl fmt::Debug for RunningTask {
+    fn fmt(&self, serializer: &mut fmt::Formatter) -> fmt::Result {
+        self.notifier.fmt(serializer)
+    }
 }
 
 impl AsRef<Notifier> for RunningTask {
@@ -494,6 +571,11 @@ impl AsRef<Notifier> for RunningTask {
 }
 
 impl RunningTask {
+    /// Return true if this task is done.
+    pub fn is_done(&self) -> bool {
+        self.notifier.continuation.lock().unwrap().is_none()
+    }
+
     /// Block until the task has finished executing.
     #[profiling::function]
     pub fn join(self) {
@@ -507,10 +589,34 @@ impl RunningTask {
         loop {
             log::trace!("Parking for {}", self.notifier);
             thread::park();
-            if self.notifier.continuation.lock().unwrap().is_none() {
-                return;
+            if self.is_done() {
+                break;
             }
         }
+    }
+
+    /// Block until the task has finished executing.
+    /// Also, use the current thread to help in the meantime.
+    #[profiling::function]
+    pub fn join_active(self) {
+        match *self.notifier.continuation.lock().unwrap() {
+            Some(ref mut cont) => {
+                cont.waiting_threads.push(thread::current());
+            }
+            None => return,
+        }
+        let index = self.choir.register().unwrap();
+        log::info!("Join thread[{}] started", index);
+
+        loop {
+            self.choir.work(index);
+            if self.is_done() {
+                break;
+            }
+        }
+
+        log::info!("Thread[{}] is released", index);
+        self.choir.unregister(index);
     }
 
     /// Block until the task has finished executing, with timeout.
@@ -542,70 +648,6 @@ impl RunningTask {
     }
 }
 
-impl Default for Choir {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Choir {
-    /// Create a new task system.
-    pub fn new() -> Self {
-        const NO_WORKER: Option<WorkerContext> = None;
-        let injector = Injector::new();
-        Self {
-            conductor: Arc::new(Conductor {
-                injector,
-                workers: RwLock::new(WorkerPool {
-                    contexts: [NO_WORKER; MAX_WORKERS],
-                }),
-                parked_mask: AtomicUsize::new(0),
-            }),
-            next_id: AtomicUsize::new(1),
-        }
-    }
-
-    /// Add a new worker thread.
-    ///
-    /// Note: A system can't have more than `MAX_WORKERS` workers
-    /// enabled at any time.
-    pub fn add_worker(&mut self, name: &str) -> WorkerHandle {
-        let worker = Arc::new(Worker {
-            name: name.to_string(),
-            alive: AtomicBool::new(true),
-        });
-        let conductor = Arc::clone(&self.conductor);
-        let worker_clone = Arc::clone(&worker);
-
-        let join_handle = thread::Builder::new()
-            .name(name.to_string())
-            .spawn(move || conductor.work_loop(&worker_clone))
-            .unwrap();
-
-        WorkerHandle {
-            worker,
-            join_handle: Some(join_handle),
-        }
-    }
-
-    /// Spawn a new task.
-    #[profiling::function]
-    pub fn spawn(&self, given_name: impl fmt::Display) -> ProtoTask {
-        let id = self.next_id.fetch_add(1, Ordering::AcqRel);
-        let name = format!("{}-{}", given_name, id);
-        log::trace!("Creating task '{}", name);
-
-        ProtoTask {
-            conductor: &self.conductor,
-            notifier: Notifier {
-                name,
-                parent: None,
-                continuation: Mutex::new(Some(Continuation::default())),
-            },
-        }
-    }
-}
-
 impl Drop for WorkerHandle {
     fn drop(&mut self) {
         self.worker.alive.store(false, Ordering::Release);
@@ -622,6 +664,7 @@ impl IdleTask<'static> {
     pub fn run(self) -> RunningTask {
         let task = self.task.as_ref();
         RunningTask {
+            choir: Arc::clone(&self.choir),
             notifier: Arc::clone(&task.notifier),
         }
     }
@@ -630,7 +673,7 @@ impl IdleTask<'static> {
 impl<'a> IdleTask<'a> {
     fn kick(&mut self) {
         if let Some(ready) = self.task.extract() {
-            self.conductor.schedule(ready);
+            self.choir.schedule(ready);
         }
     }
 
@@ -639,10 +682,11 @@ impl<'a> IdleTask<'a> {
     pub fn run_attached(mut self) {
         let task = self.task.as_ref();
         let running = RunningTask {
+            choir: Arc::clone(&self.choir),
             notifier: Arc::clone(&task.notifier),
         };
         self.kick();
-        running.join();
+        running.join_active();
     }
 
     /// Add a dependency on another task, which is possibly running.
