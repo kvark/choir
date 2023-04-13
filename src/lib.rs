@@ -80,6 +80,13 @@ pub struct ExecutionContext<'a> {
 }
 
 impl ExecutionContext<'_> {
+    /// Get the running task handle of the current task.
+    pub fn self_task(&self) -> RunningTask {
+        RunningTask {
+            choir: Arc::clone(self.choir),
+            notifier: Arc::clone(self.notifier),
+        }
+    }
     /// Fork the current task.
     ///
     /// This is useful because it allows creating tasks on the fly from within
