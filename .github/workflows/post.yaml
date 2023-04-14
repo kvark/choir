@@ -16,6 +16,7 @@ jobs:
       - name: Generate report
         uses: actions-rs/tarpaulin@v0.1
         with:
+          version: 0.22.0
           args: '--tests --workspace'
       - name: Upload to codecov.io
         uses: codecov/codecov-action@v1

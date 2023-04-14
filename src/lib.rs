@@ -516,9 +516,11 @@ impl ProtoTask<'_> {
 
     /// Init task to execute a standalone function.
     /// The function body will be executed once the task is scheduled,
-    /// and all of its dependencies are fulfulled.
+    /// and all of its dependencies are fulfilled.
     pub fn init<'a, F: FnOnce(ExecutionContext) + Send + 'a>(self, fun: F) -> IdleTask<'a> {
         let b: Box<dyn FnOnce(ExecutionContext) + Send + 'a> = Box::new(fun);
+        // Transmute is for the lifetime bound only: it's stored as `'static`,
+        // but the only way to run it is `run_attached`, which would be blocking.
         self.fill(Functor::Once(unsafe { mem::transmute(b) }))
     }
 
