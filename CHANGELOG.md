@@ -5,6 +5,7 @@
   - support non-`'static` function bodies via `run_attached()`
   - truly joining the choir when waiting on a task via `join_active()`
   - always use `Arc<Choir>`
+  - propagate panics from the tasks/workers
 
 ## v0.5 (15-08-2022)
   - all functors accept an argument of `ExecutionContext`
