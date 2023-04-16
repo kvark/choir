@@ -6,6 +6,7 @@
   - truly joining the choir when waiting on a task via `join_active()`
   - always use `Arc<Choir>`
   - propagate panics from the tasks/workers
+  - MSRV bumped to 1.60
 
 ## v0.5 (15-08-2022)
   - all functors accept an argument of `ExecutionContext`
