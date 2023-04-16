@@ -43,7 +43,7 @@ use crossbeam_deque::{Injector, Steal};
 use std::{
     fmt, mem, ops,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering},
         Arc, Mutex, RwLock,
     },
     thread, time,
@@ -57,6 +57,15 @@ struct Continuation {
     forks: usize,
     dependents: Vec<Linearc<Task>>,
     waiting_threads: Vec<thread::Thread>,
+}
+
+impl Continuation {
+    fn unpark_waiting(&mut self) {
+        for thread in self.waiting_threads.drain(..) {
+            log::trace!("\tresolving a join");
+            thread.unpark();
+        }
+    }
 }
 
 /// An object responsible to notify follow-up tasks.
@@ -77,6 +86,7 @@ impl fmt::Display for Notifier {
 pub struct ExecutionContext<'a> {
     choir: &'a Arc<Choir>,
     notifier: &'a Arc<Notifier>,
+    worker_index: isize,
 }
 
 impl ExecutionContext<'_> {
@@ -101,6 +111,18 @@ impl ExecutionContext<'_> {
                 parent: Some(Arc::clone(self.notifier)),
                 continuation: Mutex::new(Some(Continuation::default())),
             },
+        }
+    }
+}
+
+impl Drop for ExecutionContext<'_> {
+    fn drop(&mut self) {
+        if thread::panicking() {
+            self.choir.issue_panic(self.worker_index);
+            let mut guard = self.notifier.continuation.lock().unwrap();
+            if let Some(mut cont) = guard.take() {
+                cont.unpark_waiting();
+            }
         }
     }
 }
@@ -155,11 +177,28 @@ struct WorkerPool {
     contexts: [Option<WorkerContext>; MAX_WORKERS],
 }
 
+/// Return type for `join` functions that have to detect panics.
+/// Does actual panic on drop if any of the tasks have panicked.
+/// Note: an idiomatic `Result` is not used because it's not actionable.
+pub struct MaybePanic {
+    worker_index: isize,
+}
+impl Drop for MaybePanic {
+    fn drop(&mut self) {
+        assert_eq!(
+            self.worker_index, -1,
+            "Panic occurred on worker {}",
+            self.worker_index,
+        );
+    }
+}
+
 /// Main structure for managing tasks.
 pub struct Choir {
     injector: Injector<Task>,
     workers: RwLock<WorkerPool>,
     parked_mask: AtomicUsize,
+    panic_worker: AtomicIsize,
 }
 
 impl Default for Choir {
@@ -172,6 +211,7 @@ impl Default for Choir {
                 contexts: [NO_WORKER; MAX_WORKERS],
             }),
             parked_mask: AtomicUsize::new(0),
+            panic_worker: AtomicIsize::new(-1),
         }
     }
 }
@@ -243,6 +283,7 @@ impl Choir {
         let execontext = ExecutionContext {
             choir: self,
             notifier: &task.notifier,
+            worker_index,
         };
         match task.functor {
             Functor::Dummy => {
@@ -320,7 +361,7 @@ impl Choir {
         // mark the task as done
         log::trace!("Finishing task {}", notifier);
 
-        let continuation = {
+        let mut continuation = {
             let mut guard = notifier.continuation.lock().unwrap();
             if let Some(ref mut cont) = *guard {
                 if cont.forks != 0 {
@@ -332,10 +373,7 @@ impl Choir {
             guard.take().unwrap()
         };
 
-        for thread in continuation.waiting_threads {
-            log::trace!("\tresolving a join");
-            thread.unpark();
-        }
+        continuation.unpark_waiting();
 
         // unblock dependencies if needed
         for dependent in continuation.dependents {
@@ -398,6 +436,38 @@ impl Choir {
 
         log::info!("Thread '{}' dies", worker.name);
         self.unregister(index);
+    }
+
+    fn flush_queue(&self) {
+        let mut num_tasks = 0;
+        loop {
+            match self.injector.steal() {
+                Steal::Empty => {
+                    break;
+                }
+                Steal::Success(task) => {
+                    num_tasks += 1;
+                    let mut guard = task.notifier.continuation.lock().unwrap();
+                    if let Some(mut cont) = guard.take() {
+                        cont.unpark_waiting();
+                    }
+                }
+                Steal::Retry => {}
+            }
+        }
+        log::trace!("\tflushed {} tasks down the drain", num_tasks);
+    }
+
+    fn issue_panic(&self, worker_index: isize) {
+        log::debug!("panic on worker {}", worker_index);
+        self.panic_worker.store(worker_index, Ordering::Release);
+        self.flush_queue();
+    }
+
+    /// Check if any of the workers terminated with panic.
+    pub fn check_panic(&self) -> MaybePanic {
+        let worker_index = self.panic_worker.load(Ordering::Acquire);
+        MaybePanic { worker_index }
     }
 }
 
@@ -584,19 +654,19 @@ impl RunningTask {
 
     /// Block until the task has finished executing.
     #[profiling::function]
-    pub fn join(self) {
+    pub fn join(self) -> MaybePanic {
         log::debug!("Joining {}", self.notifier);
         match *self.notifier.continuation.lock().unwrap() {
             Some(ref mut cont) => {
                 cont.waiting_threads.push(thread::current());
             }
-            None => return,
+            None => return self.choir.check_panic(),
         }
         loop {
             log::trace!("Parking for {}", self.notifier);
             thread::park();
             if self.is_done() {
-                break;
+                return self.choir.check_panic();
             }
         }
     }
@@ -604,12 +674,12 @@ impl RunningTask {
     /// Block until the task has finished executing.
     /// Also, use the current thread to help in the meantime.
     #[profiling::function]
-    pub fn join_active(self) {
+    pub fn join_active(self) -> MaybePanic {
         match *self.notifier.continuation.lock().unwrap() {
             Some(ref mut cont) => {
                 cont.waiting_threads.push(thread::current());
             }
-            None => return,
+            None => return self.choir.check_panic(),
         }
         let index = self.choir.register().unwrap();
         log::info!("Join thread[{}] started", index);
@@ -623,24 +693,25 @@ impl RunningTask {
 
         log::info!("Thread[{}] is released", index);
         self.choir.unregister(index);
+        self.choir.check_panic()
     }
 
     /// Block until the task has finished executing, with timeout.
     /// Panics and prints helpful info if the timeout is reached.
-    pub fn join_debug(self, timeout: time::Duration) {
+    pub fn join_debug(self, timeout: time::Duration) -> MaybePanic {
         log::debug!("Joining {}", self.notifier);
         match *self.notifier.continuation.lock().unwrap() {
             Some(ref mut cont) => {
                 cont.waiting_threads.push(thread::current());
             }
-            None => return,
+            None => return self.choir.check_panic(),
         }
         let instant = time::Instant::now();
         loop {
             log::trace!("Parking for {}", self.notifier);
             thread::park_timeout(timeout);
-            if self.notifier.continuation.lock().unwrap().is_none() {
-                return;
+            if self.is_done() {
+                return self.choir.check_panic();
             }
             if instant.elapsed() > timeout {
                 println!("Join timeout reached for {}", self.notifier);

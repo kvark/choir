@@ -166,3 +166,11 @@ fn multi_thread_join() {
     t1.join().unwrap();
     t2.join().unwrap();
 }
+
+#[test]
+#[should_panic]
+fn task_panic() {
+    let choir = choir::Choir::new();
+    let _w = choir.add_worker("main");
+    choir.spawn("task").init(|_| panic!("Oops!")).run().join();
+}
