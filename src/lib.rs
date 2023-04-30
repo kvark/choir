@@ -89,7 +89,7 @@ pub struct ExecutionContext<'a> {
     worker_index: isize,
 }
 
-impl ExecutionContext<'_> {
+impl<'a> ExecutionContext<'a> {
     /// Get the running task handle of the current task.
     pub fn self_task(&self) -> RunningTask {
         RunningTask {
@@ -97,6 +97,12 @@ impl ExecutionContext<'_> {
             notifier: Arc::clone(self.notifier),
         }
     }
+
+    /// Return the main choir.
+    pub fn choir(&self) -> &'a Arc<Choir> {
+        self.choir
+    }
+
     /// Fork the current task.
     ///
     /// This is useful because it allows creating tasks on the fly from within
