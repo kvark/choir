@@ -41,6 +41,7 @@ pub mod util;
 use self::arc::Linearc;
 use crossbeam_deque::{Injector, Steal};
 use std::{
+    borrow::Cow,
     fmt, mem, ops,
     sync::{
         atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering},
@@ -51,6 +52,9 @@ use std::{
 
 const BITS_PER_BYTE: usize = 8;
 const MAX_WORKERS: usize = mem::size_of::<usize>() * BITS_PER_BYTE;
+
+/// Name to be associated with a task.
+pub type Name = Cow<'static, str>;
 
 #[derive(Debug, Default)]
 struct Continuation {
@@ -71,7 +75,7 @@ impl Continuation {
 /// An object responsible to notify follow-up tasks.
 #[derive(Debug)]
 pub struct Notifier {
-    name: String,
+    name: Name,
     parent: Option<Arc<Notifier>>,
     continuation: Mutex<Option<Continuation>>,
 }
@@ -113,7 +117,7 @@ impl<'a> ExecutionContext<'a> {
         ProtoTask {
             choir: self.choir,
             notifier: Notifier {
-                name: format!("{}/{}", self.notifier.name, name),
+                name: Cow::Owned(format!("{}/{}", self.notifier.name, name)),
                 parent: Some(Arc::clone(self.notifier)),
                 continuation: Mutex::new(Some(Continuation::default())),
             },
@@ -252,13 +256,13 @@ impl Choir {
     }
 
     /// Spawn a new task.
-    #[profiling::function]
-    pub fn spawn<'a>(self: &'a Arc<Self>, name: impl fmt::Display) -> ProtoTask<'a> {
+    pub fn spawn<'a, N: Into<Name>>(self: &'a Arc<Self>, name: N) -> ProtoTask<'a> {
+        let name = name.into();
         log::trace!("Creating task '{}", name);
         ProtoTask {
             choir: self,
             notifier: Notifier {
-                name: format!("{}", name),
+                name,
                 parent: None,
                 continuation: Mutex::new(Some(Continuation::default())),
             },
@@ -266,15 +270,22 @@ impl Choir {
     }
 
     fn wake_up_one(&self) {
-        let mask = self.parked_mask.load(Ordering::Acquire);
+        profiling::scope!("wake up");
+        let mut mask = self.parked_mask.load(Ordering::Acquire);
         // Wake up a thread if there is a sleeping one.
-        if mask != 0 {
+        while mask != 0 {
             let index = mask.trailing_zeros() as usize;
-            profiling::scope!("unpark");
-            log::trace!("\twaking up thread[{}]", index);
-            let pool = self.workers.read().unwrap();
-            if let Some(context) = pool.contexts[index].as_ref() {
-                context.thread.unpark();
+            let old = self.parked_mask.fetch_and(!(1 << index), Ordering::AcqRel);
+            if old & (1 << index) == 0 {
+                mask = old;
+            } else {
+                // This is guaranteed to wake up the thread.
+                let pool = self.workers.read().unwrap();
+                if let Some(context) = pool.contexts[index].as_ref() {
+                    profiling::scope!("unpark");
+                    context.thread.unpark();
+                }
+                return;
             }
         }
     }
@@ -328,10 +339,14 @@ impl Choir {
                             index
                         );
                         sub_range.end = middle;
-                        // wake up the worker
-                        let pool = self.workers.read().unwrap();
-                        if let Some(context) = pool.contexts[index].as_ref() {
-                            context.thread.unpark();
+                        // if we happen to flip the bit, actually wake up the worker
+                        let old = self.parked_mask.fetch_and(!(1 << index), Ordering::AcqRel);
+                        if old & (1 << index) != 0 {
+                            let pool = self.workers.read().unwrap();
+                            if let Some(context) = pool.contexts[index].as_ref() {
+                                profiling::scope!("unpark");
+                                context.thread.unpark();
+                            }
                         }
                     }
                 }
@@ -421,8 +436,10 @@ impl Choir {
                     // missing our parked bit.
                     profiling::scope!("park");
                     thread::park();
+                    debug_assert_eq!(self.parked_mask.load(Ordering::Acquire) & mask, 0);
+                } else {
+                    self.parked_mask.fetch_and(!mask, Ordering::Release);
                 }
-                self.parked_mask.fetch_and(!mask, Ordering::Release);
             }
             Steal::Success(task) => {
                 self.execute(task, index as isize);
@@ -774,6 +791,7 @@ impl<'a> IdleTask<'a> {
     }
 
     /// Add a dependency on another task, which is possibly running.
+    #[profiling::function]
     pub fn depend_on<D: AsRef<Notifier>>(&mut self, dependency: &D) {
         if let Some(ref mut cont) = *dependency.as_ref().continuation.lock().unwrap() {
             cont.dependents.push(self.task.share());
