@@ -56,3 +56,15 @@ Machine: MBP 2016, 3.3 GHz Dual-Core Intel Core i7
 Executing 100k empty tasks:
 - individually: 28ms
 - as a multi-task: 6ms
+
+### Profiling workflow example
+
+With Tracy:
+Add this line to the start of the benchmark:
+```rust
+let _ = profiling::tracy_client::Client::start();
+```
+Then run in command prompt:
+```bash
+cargo bench --features "profiling/profile-with-tracy"
+```
