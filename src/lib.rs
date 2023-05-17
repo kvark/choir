@@ -40,6 +40,7 @@ pub mod util;
 
 use self::arc::Linearc;
 use crossbeam_deque::{Injector, Steal};
+use crossbeam_utils::sync::{Parker, Unparker};
 use std::{
     borrow::Cow,
     fmt, mem, ops,
@@ -116,11 +117,9 @@ impl<'a> ExecutionContext<'a> {
         log::trace!("Forking task {} as '{}'", self.notifier, name);
         ProtoTask {
             choir: self.choir,
-            notifier: Notifier {
-                name: Cow::Owned(format!("{}/{}", self.notifier.name, name)),
-                parent: Some(Arc::clone(self.notifier)),
-                continuation: Mutex::new(Some(Continuation::default())),
-            },
+            name: Cow::Owned(format!("{}/{}", self.notifier.name, name)),
+            parent: Some(Arc::clone(self.notifier)),
+            dependents: Vec::new(),
         }
     }
 }
@@ -180,7 +179,7 @@ struct Worker {
 }
 
 struct WorkerContext {
-    thread: thread::Thread,
+    unparker: Unparker,
 }
 
 struct WorkerPool {
@@ -243,15 +242,18 @@ impl Choir {
         });
         let choir = Arc::clone(self);
         let worker_clone = Arc::clone(&worker);
+        let parker = Parker::new();
+        let unparker = parker.unparker().clone();
 
         let join_handle = thread::Builder::new()
             .name(name.to_string())
-            .spawn(move || choir.work_loop(&worker_clone))
+            .spawn(move || choir.work_loop(&worker_clone, parker))
             .unwrap();
 
         WorkerHandle {
             worker,
             join_handle: Some(join_handle),
+            unparker,
         }
     }
 
@@ -261,11 +263,9 @@ impl Choir {
         log::trace!("Creating task '{}", name);
         ProtoTask {
             choir: self,
-            notifier: Notifier {
-                name,
-                parent: None,
-                continuation: Mutex::new(Some(Continuation::default())),
-            },
+            name,
+            parent: None,
+            dependents: Vec::new(),
         }
     }
 
@@ -283,7 +283,7 @@ impl Choir {
                 let pool = self.workers.read().unwrap();
                 if let Some(context) = pool.contexts[index].as_ref() {
                     profiling::scope!("unpark");
-                    context.thread.unpark();
+                    context.unparker.unpark();
                 }
                 return;
             }
@@ -345,7 +345,7 @@ impl Choir {
                             let pool = self.workers.read().unwrap();
                             if let Some(context) = pool.contexts[index].as_ref() {
                                 profiling::scope!("unpark");
-                                context.thread.unpark();
+                                context.unparker.unpark();
                             }
                         }
                     }
@@ -406,11 +406,11 @@ impl Choir {
         notifier.parent.as_ref()
     }
 
-    fn register(&self) -> Option<usize> {
+    fn register(&self, parker: &Parker) -> Option<usize> {
         let mut pool = self.workers.write().unwrap();
         let index = pool.contexts.iter_mut().position(|c| c.is_none())?;
         pool.contexts[index] = Some(WorkerContext {
-            thread: thread::current(),
+            unparker: parker.unparker().clone(),
         });
         Some(index)
     }
@@ -424,7 +424,7 @@ impl Choir {
         }
     }
 
-    fn work(self: &Arc<Self>, index: usize) {
+    fn work(self: &Arc<Self>, index: usize, parker: &Parker) {
         match self.injector.steal() {
             Steal::Empty => {
                 log::trace!("Thread[{}] sleeps", index);
@@ -435,7 +435,7 @@ impl Choir {
                     // a `schedule()` call running elsewhere,
                     // missing our parked bit.
                     profiling::scope!("park");
-                    thread::park();
+                    parker.park();
                     debug_assert_eq!(self.parked_mask.load(Ordering::Acquire) & mask, 0);
                 } else {
                     self.parked_mask.fetch_and(!mask, Ordering::Release);
@@ -448,13 +448,13 @@ impl Choir {
         }
     }
 
-    fn work_loop(self: &Arc<Self>, worker: &Worker) {
+    fn work_loop(self: &Arc<Self>, worker: &Worker, parker: Parker) {
         profiling::register_thread!();
-        let index = self.register().unwrap();
+        let index = self.register(&parker).unwrap();
         log::info!("Thread[{}] = '{}' started", index, worker.name);
 
         while worker.alive.load(Ordering::Acquire) {
-            self.work(index);
+            self.work(index, &parker);
         }
 
         log::info!("Thread '{}' dies", worker.name);
@@ -498,6 +498,7 @@ impl Choir {
 pub struct WorkerHandle {
     worker: Arc<Worker>,
     join_handle: Option<thread::JoinHandle<()>>,
+    unparker: Unparker,
 }
 
 enum MaybeArc<T> {
@@ -546,7 +547,9 @@ impl<T> MaybeArc<T> {
 /// Task construct without any functional logic.
 pub struct ProtoTask<'c> {
     choir: &'c Arc<Choir>,
-    notifier: Notifier,
+    name: Name,
+    parent: Option<Arc<Notifier>>,
+    dependents: Vec<Linearc<Task>>,
 }
 
 /// Task that is created but not running yet.
@@ -577,10 +580,28 @@ impl<'a> Linearc<dyn Fn(ExecutionContext, SubIndex) + Send + Sync + 'a> {
     }
 }
 
+impl Drop for ProtoTask<'_> {
+    fn drop(&mut self) {
+        for dependent in self.dependents.drain(..) {
+            if let Some(ready) = Linearc::into_inner(dependent) {
+                self.choir.schedule(ready);
+            }
+        }
+    }
+}
+
 impl ProtoTask<'_> {
-    fn fill<'a>(self, functor: Functor) -> IdleTask<'a> {
+    /// Block another task from starting until this one is finished.
+    /// This is the reverse of `depend_on` but could be done faster because
+    /// the `self` task is not yet shared with anything.
+    pub fn as_blocker_for(mut self, other: &mut IdleTask) -> Self {
+        self.dependents.push(other.task.share());
+        self
+    }
+
+    fn fill<'a>(mut self, functor: Functor) -> IdleTask<'a> {
         // Only register the fork here, so that nothing happens if a `ProtoTask` is dropped.
-        if let Some(ref parent_notifier) = self.notifier.parent {
+        if let Some(ref parent_notifier) = self.parent {
             parent_notifier
                 .continuation
                 .lock()
@@ -593,7 +614,15 @@ impl ProtoTask<'_> {
             choir: Arc::clone(self.choir),
             task: MaybeArc::new(Task {
                 functor,
-                notifier: Arc::new(self.notifier),
+                notifier: Arc::new(Notifier {
+                    name: mem::take(&mut self.name),
+                    parent: self.parent.take(),
+                    continuation: Mutex::new(Some(Continuation {
+                        forks: 0,
+                        dependents: mem::take(&mut self.dependents),
+                        waiting_threads: Vec::new(),
+                    })),
+                }),
             }),
             _lifetime: &(),
         }
@@ -704,11 +733,12 @@ impl RunningTask {
             }
             None => return self.choir.check_panic(),
         }
-        let index = self.choir.register().unwrap();
+        let parker = Parker::new();
+        let index = self.choir.register(&parker).unwrap();
         log::info!("Join thread[{}] started", index);
 
         loop {
-            self.choir.work(index);
+            self.choir.work(index, &parker);
             if self.is_done() {
                 break;
             }
@@ -752,7 +782,7 @@ impl Drop for WorkerHandle {
     fn drop(&mut self) {
         self.worker.alive.store(false, Ordering::Release);
         let handle = self.join_handle.take().unwrap();
-        handle.thread().unpark();
+        self.unparker.unpark();
         let _ = handle.join();
     }
 }
