@@ -452,7 +452,6 @@ impl Choir {
                     // missing our parked bit.
                     profiling::scope!("park");
                     parker.park();
-                    debug_assert_eq!(self.parked_mask.load(Ordering::Acquire) & mask, 0);
                 } else {
                     self.parked_mask.fetch_and(!mask, Ordering::Release);
                 }
@@ -470,6 +469,7 @@ impl Choir {
         log::info!("Thread[{}] = '{}' started", index, worker.name);
 
         while worker.alive.load(Ordering::Acquire) {
+            debug_assert_eq!(self.parked_mask.load(Ordering::Acquire) & (1 << index), 0);
             self.work(index, &parker);
         }
 
