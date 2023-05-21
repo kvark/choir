@@ -136,6 +136,36 @@ fn proxy() {
 }
 
 #[test]
+fn fork_in_flight() {
+    let _ = env_logger::try_init();
+    let choir = choir::Choir::new();
+    let _worker1 = choir.add_worker("A");
+    let value = Arc::new(AtomicUsize::new(0));
+    let value1 = Arc::clone(&value);
+    // This task deliberately waits, so that we know for sure
+    // if it's being waited on.
+    let t1 = choir
+        .spawn("child")
+        .init(move |_| {
+            thread::sleep(Duration::from_millis(10));
+            value1.fetch_add(1, Ordering::AcqRel);
+        })
+        .run();
+    let value2 = Arc::clone(&value);
+    // This task decides to add `t1` as a fork, which is already in flight.
+    let t2 = choir.spawn("parent").init(move |ec| {
+        value2.fetch_add(1, Ordering::AcqRel);
+        ec.add_fork(&t1);
+    });
+    // This is the dependent task, it will have to wait for both.
+    let mut t3 = choir.spawn("finish").init_dummy();
+    t3.depend_on(&t2);
+    t2.run();
+    t3.run().join();
+    assert_eq!(value.load(Ordering::Acquire), 2);
+}
+
+#[test]
 fn unhelpful() {
     let choir = choir::Choir::new();
     let mut done = false;
