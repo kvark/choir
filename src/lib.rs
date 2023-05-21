@@ -59,6 +59,7 @@ pub type Name = Cow<'static, str>;
 
 #[derive(Debug, Default)]
 struct Continuation {
+    parent: Option<Arc<Notifier>>,
     forks: usize,
     dependents: Vec<Linearc<Task>>,
     waiting_threads: Vec<thread::Thread>,
@@ -77,7 +78,6 @@ impl Continuation {
 #[derive(Debug)]
 pub struct Notifier {
     name: Name,
-    parent: Option<Arc<Notifier>>,
     continuation: Mutex<Option<Continuation>>,
 }
 
@@ -110,16 +110,31 @@ impl<'a> ExecutionContext<'a> {
 
     /// Fork the current task.
     ///
+    /// The new task will block all the same dependents as the currently executing task.
+    ///
     /// This is useful because it allows creating tasks on the fly from within
     /// other tasks. Generally, making a task in flight depend on anything is impossible.
     /// But one can fork a dependency instead.
-    pub fn fork(&self, name: impl fmt::Display) -> ProtoTask {
+    pub fn fork<N: Into<Name>>(&self, name: N) -> ProtoTask {
+        let name = name.into();
         log::trace!("Forking task {} as '{}'", self.notifier, name);
         ProtoTask {
             choir: self.choir,
-            name: Cow::Owned(format!("{}/{}", self.notifier.name, name)),
+            name,
             parent: Some(Arc::clone(self.notifier)),
             dependents: Vec::new(),
+        }
+    }
+
+    /// Register an existing task as a fork.
+    ///
+    /// It will block all the dependents of the currently executing task.
+    ///
+    /// Will panic if the other task is already a fork of something.
+    pub fn add_fork<D: AsRef<Notifier>>(&self, other: &D) {
+        if let Some(ref mut continuation) = *other.as_ref().continuation.lock().unwrap() {
+            assert!(continuation.parent.is_none());
+            continuation.parent = Some(Arc::clone(self.notifier));
         }
     }
 }
@@ -309,6 +324,7 @@ impl Choir {
                     task.notifier,
                     worker_index
                 );
+                drop(execontext);
             }
             Functor::Once(fun) => {
                 log::debug!("Task {} runs on thread[{}]", task.notifier, worker_index);
@@ -371,13 +387,13 @@ impl Choir {
             }
         }
 
-        let mut notifier_ref = Some(&task.notifier);
-        while let Some(notifier) = notifier_ref {
-            notifier_ref = self.finish(notifier);
+        let mut notifier_opt = Some(task.notifier);
+        while let Some(notifier) = notifier_opt {
+            notifier_opt = self.finish(&notifier);
         }
     }
 
-    fn finish<'a>(&self, notifier: &'a Notifier) -> Option<&'a Arc<Notifier>> {
+    fn finish(&self, notifier: &Notifier) -> Option<Arc<Notifier>> {
         profiling::scope!("unblock");
         // mark the task as done
         log::trace!("Finishing task {}", notifier);
@@ -403,7 +419,7 @@ impl Choir {
             }
         }
 
-        notifier.parent.as_ref()
+        continuation.parent
     }
 
     fn register(&self, parker: &Parker) -> Option<usize> {
@@ -616,8 +632,8 @@ impl ProtoTask<'_> {
                 functor,
                 notifier: Arc::new(Notifier {
                     name: mem::take(&mut self.name),
-                    parent: self.parent.take(),
                     continuation: Mutex::new(Some(Continuation {
+                        parent: self.parent.take(),
                         forks: 0,
                         dependents: mem::take(&mut self.dependents),
                         waiting_threads: Vec::new(),
