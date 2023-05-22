@@ -135,6 +135,13 @@ impl<'a> ExecutionContext<'a> {
         if let Some(ref mut continuation) = *other.as_ref().continuation.lock().unwrap() {
             assert!(continuation.parent.is_none());
             continuation.parent = Some(Arc::clone(self.notifier));
+            self.notifier
+                .continuation
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .forks += 1;
         }
     }
 }
