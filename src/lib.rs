@@ -335,7 +335,7 @@ impl Choir {
             }
             Functor::Once(fun) => {
                 log::debug!("Task {} runs on thread[{}]", task.notifier, worker_index);
-                profiling::scope!("execute");
+                profiling::scope!(task.notifier.name.as_ref());
                 (fun)(execontext);
             }
             Functor::Multi(mut sub_range, fun) => {
@@ -374,7 +374,10 @@ impl Choir {
                     }
                 }
                 // fun the functor
-                (fun)(execontext, sub_range.start);
+                {
+                    profiling::scope!(task.notifier.name.as_ref());
+                    (fun)(execontext, sub_range.start);
+                }
                 // are we done yet?
                 sub_range.start += 1;
                 if sub_range.start == sub_range.end {
@@ -400,8 +403,8 @@ impl Choir {
         }
     }
 
+    #[profiling::function]
     fn finish(&self, notifier: &Notifier) -> Option<Arc<Notifier>> {
-        profiling::scope!("unblock");
         // mark the task as done
         log::trace!("Finishing task {}", notifier);
 
