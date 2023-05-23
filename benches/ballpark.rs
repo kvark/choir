@@ -9,6 +9,7 @@ fn work(n: choir::SubIndex) {
 
 fn many_tasks(c: &mut Criterion) {
     const TASK_COUNT: choir::SubIndex = 1_000;
+    //let _ = profiling::tracy_client::Client::start();
     let choir = choir::Choir::new();
     if true {
         let _worker = choir.add_worker("main");

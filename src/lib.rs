@@ -40,13 +40,12 @@ pub mod util;
 
 use self::arc::Linearc;
 use crossbeam_deque::{Injector, Steal};
-use crossbeam_utils::sync::{Parker, Unparker};
 use std::{
     borrow::Cow,
     fmt, mem, ops,
     sync::{
         atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering},
-        Arc, Mutex, RwLock,
+        Arc, Condvar, Mutex, RwLock,
     },
     thread, time,
 };
@@ -200,9 +199,7 @@ struct Worker {
     alive: AtomicBool,
 }
 
-struct WorkerContext {
-    unparker: Unparker,
-}
+struct WorkerContext {}
 
 struct WorkerPool {
     contexts: [Option<WorkerContext>; MAX_WORKERS],
@@ -227,8 +224,9 @@ impl Drop for MaybePanic {
 /// Main structure for managing tasks.
 pub struct Choir {
     injector: Injector<Task>,
+    condvar: Condvar,
+    parked_mask_mutex: Mutex<usize>,
     workers: RwLock<WorkerPool>,
-    parked_mask: AtomicUsize,
     panic_worker: AtomicIsize,
 }
 
@@ -238,10 +236,11 @@ impl Default for Choir {
         let injector = Injector::new();
         Self {
             injector,
+            condvar: Condvar::default(),
+            parked_mask_mutex: Mutex::new(0),
             workers: RwLock::new(WorkerPool {
                 contexts: [NO_WORKER; MAX_WORKERS],
             }),
-            parked_mask: AtomicUsize::new(0),
             panic_worker: AtomicIsize::new(-1),
         }
     }
@@ -262,20 +261,18 @@ impl Choir {
             name: name.to_string(),
             alive: AtomicBool::new(true),
         });
-        let choir = Arc::clone(self);
         let worker_clone = Arc::clone(&worker);
-        let parker = Parker::new();
-        let unparker = parker.unparker().clone();
+        let choir = Arc::clone(self);
 
         let join_handle = thread::Builder::new()
             .name(name.to_string())
-            .spawn(move || choir.work_loop(&worker_clone, parker))
+            .spawn(move || choir.work_loop(&worker_clone))
             .unwrap();
 
         WorkerHandle {
             worker,
             join_handle: Some(join_handle),
-            unparker,
+            choir: Arc::clone(self),
         }
     }
 
@@ -291,31 +288,10 @@ impl Choir {
         }
     }
 
-    fn wake_up_one(&self) {
-        profiling::scope!("wake up");
-        let mut mask = self.parked_mask.load(Ordering::Acquire);
-        // Wake up a thread if there is a sleeping one.
-        while mask != 0 {
-            let index = mask.trailing_zeros() as usize;
-            let old = self.parked_mask.fetch_and(!(1 << index), Ordering::AcqRel);
-            if old & (1 << index) == 0 {
-                mask = old;
-            } else {
-                // This is guaranteed to wake up the thread.
-                let pool = self.workers.read().unwrap();
-                if let Some(context) = pool.contexts[index].as_ref() {
-                    profiling::scope!("unpark");
-                    context.unparker.unpark();
-                }
-                return;
-            }
-        }
-    }
-
     fn schedule(&self, task: Task) {
         log::trace!("Task {} is scheduled", task.notifier);
         self.injector.push(task);
-        self.wake_up_one();
+        self.condvar.notify_one();
     }
 
     fn execute(self: &Arc<Self>, task: Task, worker_index: isize) {
@@ -348,30 +324,14 @@ impl Choir {
                 debug_assert!(sub_range.start < sub_range.end);
                 let middle = (sub_range.end + sub_range.start) >> 1;
                 // split the task if needed
-                if middle != sub_range.start {
-                    let mask = self.parked_mask.load(Ordering::Acquire);
-                    if mask != 0 {
-                        self.injector.push(Task {
-                            functor: Functor::Multi(middle..sub_range.end, Linearc::clone(&fun)),
-                            notifier: Arc::clone(&task.notifier),
-                        });
-                        let index = mask.trailing_zeros() as usize;
-                        log::trace!(
-                            "\tsplit out {:?} for thread[{}]",
-                            middle..sub_range.end,
-                            index
-                        );
-                        sub_range.end = middle;
-                        // if we happen to flip the bit, actually wake up the worker
-                        let old = self.parked_mask.fetch_and(!(1 << index), Ordering::AcqRel);
-                        if old & (1 << index) != 0 {
-                            let pool = self.workers.read().unwrap();
-                            if let Some(context) = pool.contexts[index].as_ref() {
-                                profiling::scope!("unpark");
-                                context.unparker.unpark();
-                            }
-                        }
-                    }
+                if middle != sub_range.start && *self.parked_mask_mutex.lock().unwrap() != 0 {
+                    self.injector.push(Task {
+                        functor: Functor::Multi(middle..sub_range.end, Linearc::clone(&fun)),
+                        notifier: Arc::clone(&task.notifier),
+                    });
+                    log::trace!("\tsplit out {:?}", middle..sub_range.end);
+                    sub_range.end = middle;
+                    self.condvar.notify_one();
                 }
                 // fun the functor
                 {
@@ -432,12 +392,10 @@ impl Choir {
         continuation.parent
     }
 
-    fn register(&self, parker: &Parker) -> Option<usize> {
+    fn register(&self) -> Option<usize> {
         let mut pool = self.workers.write().unwrap();
         let index = pool.contexts.iter_mut().position(|c| c.is_none())?;
-        pool.contexts[index] = Some(WorkerContext {
-            unparker: parker.unparker().clone(),
-        });
+        pool.contexts[index] = Some(WorkerContext {});
         Some(index)
     }
 
@@ -445,26 +403,18 @@ impl Choir {
         self.workers.write().unwrap().contexts[index] = None;
         // Avoid a situation where choir is expecting this thread
         // to help with more tasks.
-        if !self.injector.is_empty() {
-            self.wake_up_one();
-        }
+        self.condvar.notify_one();
     }
 
-    fn work(self: &Arc<Self>, index: usize, parker: &Parker) {
+    fn work(self: &Arc<Self>, index: usize) {
         match self.injector.steal() {
             Steal::Empty => {
                 log::trace!("Thread[{}] sleeps", index);
                 let mask = 1 << index;
-                self.parked_mask.fetch_or(mask, Ordering::Release);
-                if self.injector.is_empty() {
-                    // We are on our way to sleep, but there might be
-                    // a `schedule()` call running elsewhere,
-                    // missing our parked bit.
-                    profiling::scope!("park");
-                    parker.park();
-                } else {
-                    self.parked_mask.fetch_and(!mask, Ordering::Release);
-                }
+                let mut parked_mask = self.parked_mask_mutex.lock().unwrap();
+                *parked_mask |= mask;
+                parked_mask = self.condvar.wait(parked_mask).unwrap();
+                *parked_mask &= !mask;
             }
             Steal::Success(task) => {
                 self.execute(task, index as isize);
@@ -473,14 +423,13 @@ impl Choir {
         }
     }
 
-    fn work_loop(self: &Arc<Self>, worker: &Worker, parker: Parker) {
+    fn work_loop(self: &Arc<Self>, worker: &Worker) {
         profiling::register_thread!();
-        let index = self.register(&parker).unwrap();
+        let index = self.register().unwrap();
         log::info!("Thread[{}] = '{}' started", index, worker.name);
 
         while worker.alive.load(Ordering::Acquire) {
-            debug_assert_eq!(self.parked_mask.load(Ordering::Acquire) & (1 << index), 0);
-            self.work(index, &parker);
+            self.work(index);
         }
 
         log::info!("Thread '{}' dies", worker.name);
@@ -524,7 +473,7 @@ impl Choir {
 pub struct WorkerHandle {
     worker: Arc<Worker>,
     join_handle: Option<thread::JoinHandle<()>>,
-    unparker: Unparker,
+    choir: Arc<Choir>,
 }
 
 enum MaybeArc<T> {
@@ -759,12 +708,11 @@ impl RunningTask {
             }
             None => return self.choir.check_panic(),
         }
-        let parker = Parker::new();
-        let index = self.choir.register(&parker).unwrap();
+        let index = self.choir.register().unwrap();
         log::info!("Join thread[{}] started", index);
 
         loop {
-            self.choir.work(index, &parker);
+            self.choir.work(index);
             if self.is_done() {
                 break;
             }
@@ -808,7 +756,8 @@ impl Drop for WorkerHandle {
     fn drop(&mut self) {
         self.worker.alive.store(false, Ordering::Release);
         let handle = self.join_handle.take().unwrap();
-        self.unparker.unpark();
+        // make sure it wakes up and checks if it's still alive
+        self.choir.condvar.notify_all();
         let _ = handle.join();
     }
 }
