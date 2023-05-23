@@ -8,6 +8,7 @@
   - always use `Arc<Choir>`
   - propagate panics from the tasks/workers
   - expose `choir` in the tasks and execution contexts
+  - `Condvar`-based thread blocking
   - MSRV bumped to 1.60
 
 ## v0.5 (15-08-2022)
