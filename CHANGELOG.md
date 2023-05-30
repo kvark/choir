@@ -1,6 +1,6 @@
 # Change Log
 
-## v0.6 (TBD)
+## v0.6 (30-05-2023)
   - redesign fork semantics that's more robust and supports `join()`
   - add an ability to add an existing task as a fork
   - support non-`'static` function bodies via `run_attached()`
