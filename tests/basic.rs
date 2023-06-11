@@ -189,9 +189,9 @@ fn multi_thread_join() {
         })
         .run();
     let r1 = running.clone();
-    let t1 = thread::spawn(|| r1.join());
+    let t1 = thread::spawn(move || r1.join());
     let r2 = running.clone();
-    let t2 = thread::spawn(|| r2.join());
+    let t2 = thread::spawn(move || r2.join());
     t1.join().unwrap();
     t2.join().unwrap();
 }
