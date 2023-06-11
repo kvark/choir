@@ -681,7 +681,7 @@ impl RunningTask {
 
     /// Block until the task has finished executing.
     #[profiling::function]
-    pub fn join(self) -> MaybePanic {
+    pub fn join(&self) -> MaybePanic {
         log::debug!("Joining {}", self.notifier);
         match *self.notifier.continuation.lock().unwrap() {
             Some(ref mut cont) => {
@@ -701,7 +701,7 @@ impl RunningTask {
     /// Block until the task has finished executing.
     /// Also, use the current thread to help in the meantime.
     #[profiling::function]
-    pub fn join_active(self) -> MaybePanic {
+    pub fn join_active(&self) -> MaybePanic {
         match *self.notifier.continuation.lock().unwrap() {
             Some(ref mut cont) => {
                 cont.waiting_threads.push(thread::current());
@@ -725,7 +725,7 @@ impl RunningTask {
 
     /// Block until the task has finished executing, with timeout.
     /// Panics and prints helpful info if the timeout is reached.
-    pub fn join_debug(self, timeout: time::Duration) -> MaybePanic {
+    pub fn join_debug(&self, timeout: time::Duration) -> MaybePanic {
         log::debug!("Joining {}", self.notifier);
         match *self.notifier.continuation.lock().unwrap() {
             Some(ref mut cont) => {
