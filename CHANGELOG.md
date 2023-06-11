@@ -2,6 +2,7 @@
 
 ## v0.7 (TBD)
   - make `join()` to work with `&self`
+  - reimplement `join()` in a robust way
 
 ## v0.6 (30-05-2023)
   - redesign fork semantics that's more robust and supports `join()`
