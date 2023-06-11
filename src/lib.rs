@@ -56,19 +56,31 @@ const MAX_WORKERS: usize = mem::size_of::<usize>() * BITS_PER_BYTE;
 /// Name to be associated with a task.
 pub type Name = Cow<'static, str>;
 
+#[derive(Debug)]
+struct WaitingThread {
+    // The conditional variable lives on the stack of the
+    // thread that is currently waiting, during the lifetime
+    // of this pointer, so it's safe.
+    condvar: *const Condvar,
+}
+unsafe impl Send for WaitingThread {}
+unsafe impl Sync for WaitingThread {}
+
 #[derive(Debug, Default)]
 struct Continuation {
     parent: Option<Arc<Notifier>>,
     forks: usize,
     dependents: Vec<Linearc<Task>>,
-    waiting_threads: Vec<thread::Thread>,
+    waiting_threads: Vec<WaitingThread>,
 }
 
 impl Continuation {
     fn unpark_waiting(&mut self) {
-        for thread in self.waiting_threads.drain(..) {
+        for wt in self.waiting_threads.drain(..) {
             log::trace!("\tresolving a join");
-            thread.unpark();
+            unsafe {
+                (*wt.condvar).notify_all();
+            }
         }
     }
 }
@@ -683,28 +695,28 @@ impl RunningTask {
     #[profiling::function]
     pub fn join(&self) -> MaybePanic {
         log::debug!("Joining {}", self.notifier);
-        match *self.notifier.continuation.lock().unwrap() {
-            Some(ref mut cont) => {
-                cont.waiting_threads.push(thread::current());
-            }
-            None => return self.choir.check_panic(),
+        let mut guard = self.notifier.continuation.lock().unwrap();
+        // This code is a bit magical,
+        // and it's amazing to see it compiling and working.
+        if let Some(ref mut cont) = *guard {
+            let condvar = Condvar::new();
+            cont.waiting_threads
+                .push(WaitingThread { condvar: &condvar });
+            let _ = condvar.wait_while(guard, |cont| cont.is_some());
         }
-        loop {
-            log::trace!("Parking for {}", self.notifier);
-            thread::park();
-            if self.is_done() {
-                return self.choir.check_panic();
-            }
-        }
+        self.choir.check_panic()
     }
 
     /// Block until the task has finished executing.
     /// Also, use the current thread to help in the meantime.
     #[profiling::function]
     pub fn join_active(&self) -> MaybePanic {
+        let condvar;
         match *self.notifier.continuation.lock().unwrap() {
             Some(ref mut cont) => {
-                cont.waiting_threads.push(thread::current());
+                condvar = Condvar::new();
+                cont.waiting_threads
+                    .push(WaitingThread { condvar: &condvar });
             }
             None => return self.choir.check_panic(),
         }
@@ -712,8 +724,24 @@ impl RunningTask {
         log::info!("Join thread[{}] started", index);
 
         loop {
-            self.choir.work(index);
-            if self.is_done() {
+            let is_done = match self.choir.injector.steal() {
+                Steal::Empty => {
+                    log::trace!("Thread[{}] sleeps", index);
+                    let guard = self.notifier.continuation.lock().unwrap();
+                    if guard.is_some() {
+                        let guard = condvar.wait(guard).unwrap();
+                        guard.is_none()
+                    } else {
+                        false
+                    }
+                }
+                Steal::Success(task) => {
+                    self.choir.execute(task, index as isize);
+                    self.is_done()
+                }
+                Steal::Retry => false,
+            };
+            if is_done {
                 break;
             }
         }
@@ -727,28 +755,21 @@ impl RunningTask {
     /// Panics and prints helpful info if the timeout is reached.
     pub fn join_debug(&self, timeout: time::Duration) -> MaybePanic {
         log::debug!("Joining {}", self.notifier);
-        match *self.notifier.continuation.lock().unwrap() {
-            Some(ref mut cont) => {
-                cont.waiting_threads.push(thread::current());
-            }
-            None => return self.choir.check_panic(),
-        }
-        let instant = time::Instant::now();
-        loop {
-            log::trace!("Parking for {}", self.notifier);
-            thread::park_timeout(timeout);
-            if self.is_done() {
-                return self.choir.check_panic();
-            }
-            if instant.elapsed() > timeout {
+        let mut guard = self.notifier.continuation.lock().unwrap();
+        if let Some(ref mut cont) = *guard {
+            let condvar = Condvar::new();
+            cont.waiting_threads
+                .push(WaitingThread { condvar: &condvar });
+            let (guard, wait_result) = condvar
+                .wait_timeout_while(guard, timeout, |cont| cont.is_some())
+                .unwrap();
+            if wait_result.timed_out() {
                 println!("Join timeout reached for {}", self.notifier);
-                println!(
-                    "Continuation: {:?}",
-                    self.notifier.continuation.lock().unwrap()
-                );
+                println!("Continuation: {:?}", guard);
                 panic!("");
             }
         }
+        self.choir.check_panic()
     }
 }
 
