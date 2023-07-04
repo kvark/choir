@@ -165,6 +165,34 @@ fn fork_in_flight() {
 }
 
 #[test]
+fn fork_interdep() {
+    let _ = env_logger::try_init();
+    let choir = choir::Choir::new();
+    let _worker1 = choir.add_worker("A");
+    let value = Arc::new(AtomicUsize::new(0));
+    let value1 = Arc::clone(&value);
+    let value2 = Arc::clone(&value);
+    let value3 = Arc::clone(&value);
+    choir
+        .spawn("parent")
+        .init(move |ec| {
+            assert_eq!(0, value1.fetch_add(1, Ordering::AcqRel));
+            let t1 = ec.choir().spawn("child").init(move |_| {
+                thread::sleep(Duration::from_millis(20));
+                assert_eq!(1, value2.fetch_add(1, Ordering::AcqRel));
+            });
+            let mut t2 = ec.fork("fork").init(move |_| {
+                thread::sleep(Duration::from_millis(10));
+                assert_eq!(2, value3.fetch_add(1, Ordering::AcqRel));
+            });
+            t2.depend_on(&t1);
+        })
+        .run()
+        .join();
+    assert_eq!(value.load(Ordering::Acquire), 3);
+}
+
+#[test]
 fn unhelpful() {
     let choir = choir::Choir::new();
     let mut done = false;
