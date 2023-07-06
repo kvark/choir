@@ -380,7 +380,7 @@ impl Choir {
         // mark the task as done
         log::trace!("Finishing task {}", notifier);
 
-        let mut continuation = {
+        let continuation = {
             let mut guard = notifier.continuation.lock().unwrap();
             if let Some(ref mut cont) = *guard {
                 if cont.forks != 0 {
@@ -389,10 +389,13 @@ impl Choir {
                     return None;
                 }
             }
-            guard.take().unwrap()
+            let mut cont = guard.take().unwrap();
+            //Note: this is important to do within the lock,
+            // so that anything waiting for the unpark signal
+            // is guaranteed to be notified.
+            cont.unpark_waiting();
+            cont
         };
-
-        continuation.unpark_waiting();
 
         // unblock dependencies if needed
         for dependent in continuation.dependents {
