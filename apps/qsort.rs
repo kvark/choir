@@ -1,5 +1,5 @@
 use rand::Rng as _;
-use std::{mem, ptr};
+use std::{mem, ptr, slice};
 
 type Value = i64;
 
@@ -54,13 +54,17 @@ fn split(data: &mut [Value]) -> (&mut [Value], &mut [Value]) {
     }
 }
 
-fn qsort(data: &mut [Value], context: choir::ExecutionContext) {
-    if data.len() > 5 {
-        let (left, right) = split(data);
-        context.fork("left").init(move |ec| qsort(left, ec));
-        context.fork("right").init(move |ec| qsort(right, ec));
-    } else if data.len() > 1 {
-        insertion_sort(data)
+fn qsort(data: *mut Value, size: usize, context: choir::ExecutionContext) {
+    if size > 5 {
+        let (left, right) = split(unsafe { slice::from_raw_parts_mut(data, size) });
+        context
+            .fork("left")
+            .init(move |ec| qsort(left.as_mut_ptr(), left.len(), ec));
+        context
+            .fork("right")
+            .init(move |ec| qsort(right.as_mut_ptr(), right.len(), ec));
+    } else if size > 1 {
+        insertion_sort(unsafe { slice::from_raw_parts_mut(data, size) })
     }
 }
 
@@ -78,10 +82,10 @@ fn main() {
         let choir = choir::Choir::new();
         let _worker1 = choir.add_worker("worker1");
         let _worker2 = choir.add_worker("worker2");
-        let data_slice = data.as_mut_slice();
+        let data_ptr = data.as_mut_ptr() as usize;
         choir
             .spawn("main")
-            .init(move |ec| qsort(data_slice, ec))
+            .init(move |ec| qsort(data_ptr as *mut Value, COUNT, ec))
             .run_attached();
     } else {
         insertion_sort(&mut data);

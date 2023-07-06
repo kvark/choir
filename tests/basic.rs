@@ -1,6 +1,6 @@
 use std::{
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     thread,
@@ -100,7 +100,7 @@ fn iter_xor() {
 
     choir
         .spawn("")
-        .init_iter(0..n, move |item| {
+        .init_iter(0..n, move |_, item| {
             value_other.fetch_xor(item, Ordering::SeqCst);
         })
         .run()
@@ -195,14 +195,15 @@ fn fork_interdep() {
 #[test]
 fn unhelpful() {
     let choir = choir::Choir::new();
-    let mut done = false;
+    let done = Arc::new(AtomicBool::new(false));
+    let done_final = Arc::clone(&done);
     choir
         .spawn("task")
-        .init(|_| {
-            done = true;
+        .init(move |_| {
+            done.store(true, Ordering::Release);
         })
         .run_attached();
-    assert!(done);
+    assert!(done_final.load(Ordering::Acquire));
 }
 
 #[test]
