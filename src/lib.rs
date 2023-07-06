@@ -291,7 +291,7 @@ impl Choir {
     /// Spawn a new task.
     pub fn spawn<'a, N: Into<Name>>(self: &'a Arc<Self>, name: N) -> ProtoTask<'a> {
         let name = name.into();
-        log::trace!("Creating task '{}", name);
+        log::trace!("Creating task '{}'", name);
         ProtoTask {
             choir: self,
             name,
@@ -426,17 +426,22 @@ impl Choir {
         let index = self.register().unwrap();
         log::info!("Thread[{}] = '{}' started", index, worker.name);
 
-        loop {
+        while worker.alive.load(Ordering::Acquire) {
             match self.injector.steal() {
                 Steal::Empty => {
                     log::trace!("Thread[{}] sleeps", index);
                     let mask = 1 << index;
                     let mut parked_mask = self.parked_mask_mutex.lock().unwrap();
-                    if !worker.alive.load(Ordering::Acquire) {
-                        break;
-                    }
+                    // Note: the check for `injector.is_empty()` here ensures that
+                    // we handle a race condition between something pushing a task,
+                    // and the thread going on the way to sleep.
                     *parked_mask |= mask;
-                    parked_mask = self.condvar.wait(parked_mask).unwrap();
+                    parked_mask = self
+                        .condvar
+                        .wait_while(parked_mask, |_| {
+                            worker.alive.load(Ordering::Acquire) && self.injector.is_empty()
+                        })
+                        .unwrap();
                     *parked_mask &= !mask;
                 }
                 Steal::Success(task) => {
