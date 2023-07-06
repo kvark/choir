@@ -543,13 +543,12 @@ pub struct ProtoTask<'c> {
 /// It will be scheduled on `run()` or on drop.
 /// The 'a lifetime is responsible for the data
 /// in the closure of the task function.
-pub struct IdleTask<'a> {
+pub struct IdleTask {
     choir: Arc<Choir>,
     task: MaybeArc<Task>,
-    _lifetime: &'a (),
 }
 
-impl AsRef<Notifier> for IdleTask<'_> {
+impl AsRef<Notifier> for IdleTask {
     fn as_ref(&self) -> &Notifier {
         &self.task.as_ref().notifier
     }
@@ -586,7 +585,7 @@ impl ProtoTask<'_> {
         self
     }
 
-    fn fill<'a>(mut self, functor: Functor) -> IdleTask<'a> {
+    fn fill(mut self, functor: Functor) -> IdleTask {
         // Only register the fork here, so that nothing happens if a `ProtoTask` is dropped.
         if let Some(ref parent_notifier) = self.parent {
             parent_notifier
@@ -611,7 +610,6 @@ impl ProtoTask<'_> {
                     })),
                 }),
             }),
-            _lifetime: &(),
         }
     }
 
@@ -619,15 +617,15 @@ impl ProtoTask<'_> {
     /// Can be useful to aggregate dependencies, for example
     /// if a function returns a task handle, and it launches
     /// multiple sub-tasks in parallel.
-    pub fn init_dummy(self) -> IdleTask<'static> {
+    pub fn init_dummy(self) -> IdleTask {
         self.fill(Functor::Dummy)
     }
 
     /// Init task to execute a standalone function.
     /// The function body will be executed once the task is scheduled,
     /// and all of its dependencies are fulfilled.
-    pub fn init<'a, F: FnOnce(ExecutionContext) + Send + 'a>(self, fun: F) -> IdleTask<'a> {
-        let b: Box<dyn FnOnce(ExecutionContext) + Send + 'a> = Box::new(fun);
+    pub fn init<F: FnOnce(ExecutionContext) + Send + 'static>(self, fun: F) -> IdleTask {
+        let b: Box<dyn FnOnce(ExecutionContext) + Send + 'static> = Box::new(fun);
         // Transmute is for the lifetime bound only: it's stored as `'static`,
         // but the only way to run it is `run_attached`, which would be blocking.
         self.fill(Functor::Once(unsafe { mem::transmute(b) }))
@@ -636,15 +634,15 @@ impl ProtoTask<'_> {
     /// Init task to execute a function multiple times.
     /// Every invocation is given an index in 0..count
     /// There are no ordering guarantees between the indices.
-    pub fn init_multi<'a, F: Fn(ExecutionContext, SubIndex) + Send + Sync + 'a>(
+    pub fn init_multi<F: Fn(ExecutionContext, SubIndex) + Send + Sync + 'static>(
         self,
         count: SubIndex,
         fun: F,
-    ) -> IdleTask<'a> {
+    ) -> IdleTask {
         self.fill(if count == 0 {
             Functor::Dummy
         } else {
-            let arc: Linearc<dyn Fn(ExecutionContext, SubIndex) + Send + Sync + 'a> =
+            let arc: Linearc<dyn Fn(ExecutionContext, SubIndex) + Send + Sync + 'static> =
                 Linearc::new_unsized(fun);
             Functor::Multi(0..count, unsafe { mem::transmute(arc) })
         })
@@ -653,15 +651,15 @@ impl ProtoTask<'_> {
     /// Init task to execute a function on each element of a finite iterator.
     /// Similarly to `init_multi`, each invocation is executed
     /// indepdently and can be out of order.
-    pub fn init_iter<'a, I, F>(self, iter: I, fun: F) -> IdleTask<'a>
+    pub fn init_iter<I, F>(self, iter: I, fun: F) -> IdleTask
     where
         I: Iterator,
-        I::Item: Send + 'a,
-        F: Fn(I::Item) + Send + Sync + 'a,
+        I::Item: Send + 'static,
+        F: Fn(ExecutionContext, I::Item) + Send + Sync + 'static,
     {
         let task_data = iter.collect::<util::PerTaskData<_>>();
-        self.init_multi(task_data.len(), move |_, index| unsafe {
-            fun(task_data.take(index))
+        self.init_multi(task_data.len(), move |exe_context, index| unsafe {
+            fun(exe_context, task_data.take(index))
         })
     }
 }
@@ -783,7 +781,7 @@ impl Drop for WorkerHandle {
     }
 }
 
-impl IdleTask<'static> {
+impl IdleTask {
     /// Schedule this task for running.
     ///
     /// It will only be executed once the dependencies are fulfilled.
@@ -794,9 +792,7 @@ impl IdleTask<'static> {
             notifier: Arc::clone(&task.notifier),
         }
     }
-}
 
-impl<'a> IdleTask<'a> {
     /// Run the task now and block until it's executed.
     /// Use the current thread to help the choir in the meantime.
     pub fn run_attached(mut self) {
@@ -825,7 +821,7 @@ impl<'a> IdleTask<'a> {
     }
 }
 
-impl Drop for IdleTask<'_> {
+impl Drop for IdleTask {
     fn drop(&mut self) {
         if let Some(ready) = self.task.extract() {
             self.choir.schedule(ready);

@@ -17,7 +17,7 @@ fn many_tasks(c: &mut Criterion) {
             b.iter(|| {
                 let mut parent = choir.spawn("parent").init_dummy();
                 for i in 0..TASK_COUNT {
-                    let task = choir.spawn("").init(|_| work(i));
+                    let task = choir.spawn("").init(move |_| work(i));
                     parent.depend_on(&task);
                 }
                 parent.run().join();
@@ -27,7 +27,7 @@ fn many_tasks(c: &mut Criterion) {
             b.iter(|| {
                 choir
                     .spawn("")
-                    .init_multi(TASK_COUNT, |_, i| work(i))
+                    .init_multi(TASK_COUNT, move |_, i| work(i))
                     .run()
                     .join();
             });
@@ -43,7 +43,7 @@ fn many_tasks(c: &mut Criterion) {
             b.iter(|| {
                 let mut parent = choir.spawn("parent").init_dummy();
                 for i in 0..TASK_COUNT {
-                    let task = choir.spawn("").init(|_| work(i));
+                    let task = choir.spawn("").init(move |_| work(i));
                     parent.depend_on(&task);
                 }
                 parent.run().join();
@@ -53,7 +53,7 @@ fn many_tasks(c: &mut Criterion) {
             b.iter(|| {
                 choir
                     .spawn("")
-                    .init_multi(TASK_COUNT, |_, i| work(i))
+                    .init_multi(TASK_COUNT, move |_, i| work(i))
                     .run()
                     .join();
             });
