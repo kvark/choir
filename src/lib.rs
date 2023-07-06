@@ -418,30 +418,29 @@ impl Choir {
         self.condvar.notify_one();
     }
 
-    fn work(self: &Arc<Self>, index: usize) {
-        match self.injector.steal() {
-            Steal::Empty => {
-                log::trace!("Thread[{}] sleeps", index);
-                let mask = 1 << index;
-                let mut parked_mask = self.parked_mask_mutex.lock().unwrap();
-                *parked_mask |= mask;
-                parked_mask = self.condvar.wait(parked_mask).unwrap();
-                *parked_mask &= !mask;
-            }
-            Steal::Success(task) => {
-                self.execute(task, index as isize);
-            }
-            Steal::Retry => {}
-        }
-    }
-
     fn work_loop(self: &Arc<Self>, worker: &Worker) {
         profiling::register_thread!();
         let index = self.register().unwrap();
         log::info!("Thread[{}] = '{}' started", index, worker.name);
 
-        while worker.alive.load(Ordering::Acquire) {
-            self.work(index);
+        loop {
+            match self.injector.steal() {
+                Steal::Empty => {
+                    log::trace!("Thread[{}] sleeps", index);
+                    let mask = 1 << index;
+                    let mut parked_mask = self.parked_mask_mutex.lock().unwrap();
+                    if !worker.alive.load(Ordering::Acquire) {
+                        break;
+                    }
+                    *parked_mask |= mask;
+                    parked_mask = self.condvar.wait(parked_mask).unwrap();
+                    *parked_mask &= !mask;
+                }
+                Steal::Success(task) => {
+                    self.execute(task, index as isize);
+                }
+                Steal::Retry => {}
+            }
         }
 
         log::info!("Thread '{}' dies", worker.name);
@@ -776,7 +775,11 @@ impl Drop for WorkerHandle {
         self.worker.alive.store(false, Ordering::Release);
         let handle = self.join_handle.take().unwrap();
         // make sure it wakes up and checks if it's still alive
-        self.choir.condvar.notify_all();
+        // Locking the mutex is required to guarantee that the worker loop
+        // actually receives the notification.
+        if let Ok(_guard) = self.choir.parked_mask_mutex.lock() {
+            self.choir.condvar.notify_all();
+        }
         let _ = handle.join();
     }
 }
