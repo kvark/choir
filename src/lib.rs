@@ -68,7 +68,7 @@ unsafe impl Sync for WaitingThread {}
 
 #[derive(Debug, Default)]
 struct Continuation {
-    parent: Option<Arc<Notifier>>,
+    parents: Vec<Arc<Notifier>>,
     forks: usize,
     dependents: Vec<Linearc<Task>>,
     waiting_threads: Vec<WaitingThread>,
@@ -144,8 +144,7 @@ impl<'a> ExecutionContext<'a> {
     /// Will panic if the other task is already a fork of something.
     pub fn add_fork<D: AsRef<Notifier>>(&self, other: &D) {
         if let Some(ref mut continuation) = *other.as_ref().continuation.lock().unwrap() {
-            assert!(continuation.parent.is_none());
-            continuation.parent = Some(Arc::clone(self.notifier));
+            continuation.parents.push(Arc::clone(self.notifier));
             self.notifier
                 .continuation
                 .lock()
@@ -369,14 +368,14 @@ impl Choir {
             }
         }
 
-        let mut notifier_opt = Some(task.notifier);
-        while let Some(notifier) = notifier_opt {
-            notifier_opt = self.finish(&notifier);
+        let mut notifiers = self.finish(&task.notifier);
+        while let Some(notifier) = notifiers.pop() {
+            notifiers.extend(self.finish(&notifier));
         }
     }
 
     #[profiling::function]
-    fn finish(&self, notifier: &Notifier) -> Option<Arc<Notifier>> {
+    fn finish(&self, notifier: &Notifier) -> Vec<Arc<Notifier>> {
         // mark the task as done
         log::trace!("Finishing task {}", notifier);
 
@@ -386,7 +385,7 @@ impl Choir {
                 if cont.forks != 0 {
                     log::trace!("\t{} forks are still alive", cont.forks);
                     cont.forks -= 1;
-                    return None;
+                    return Vec::new();
                 }
             }
             let mut cont = guard.take().unwrap();
@@ -404,7 +403,7 @@ impl Choir {
             }
         }
 
-        continuation.parent
+        continuation.parents
     }
 
     fn register(&self) -> Option<usize> {
@@ -610,7 +609,7 @@ impl ProtoTask<'_> {
                 notifier: Arc::new(Notifier {
                     name: mem::take(&mut self.name),
                     continuation: Mutex::new(Some(Continuation {
-                        parent: self.parent.take(),
+                        parents: self.parent.take().into_iter().collect(),
                         forks: 0,
                         dependents: mem::take(&mut self.dependents),
                         waiting_threads: Vec::new(),

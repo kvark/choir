@@ -227,6 +227,14 @@ fn multi_thread_join() {
 
 #[test]
 #[should_panic]
+fn join_timeout() {
+    let choir = choir::Choir::new();
+    let task = choir.spawn("test").init_dummy();
+    task.run().join_debug(Default::default());
+}
+
+#[test]
+#[should_panic]
 fn task_panic() {
     let choir = choir::Choir::new();
     let _w = choir.add_worker("main");
