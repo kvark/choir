@@ -39,12 +39,15 @@ This object also allows adding dependencies before scheduling the task. The runn
 
 Note that all tasks are pre-empted at the `Fn()` execution boundary. Thus, for example, a long-running multi task will be pre-empted by any incoming single-run tasks.
 
-### TODO:
-  - loop detection
-  - heavy use case
-  - loom testing
+## Users
 
-## Rough numbers
+[Blade](https://github.com/kvark/blade) heavily relies on Choir for parallelizing the asset loading. See [blade-asset talk](https://youtu.be/1DiA3OYqvqU) at Rust Gamedev meetup for details.
+
+### TODO:
+  - detect when dependencies aren't set up correctly
+  - test with [Loom](https://github.com/tokio-rs/loom): blocked by https://github.com/crossbeam-rs/crossbeam/pull/849
+
+## Overhead
 
 Machine: MBP 2016, 3.3 GHz Dual-Core Intel Core i7
 

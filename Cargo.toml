@@ -1,6 +1,6 @@
 [package]
 name = "choir"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 description = "Task Orchestration Framework"
 license = "MIT"
@@ -24,6 +24,6 @@ log = "0.4"
 profiling = "1"
 
 [dev-dependencies]
-criterion = "0.4"
+criterion = "0.5"
 env_logger = "0.9"
 num_cpus = "1"

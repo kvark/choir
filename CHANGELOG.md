@@ -1,6 +1,6 @@
 # Change Log
 
-## v0.7 (TBD)
+## v0.7 (07-11-2023)
   - make `join()` to work with `&self`
   - reimplement `join()` in a robust way
   - remove non-static tasks
