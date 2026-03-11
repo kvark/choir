@@ -2,6 +2,7 @@
 name = "choir"
 version = "0.7.0"
 edition = "2021"
+rust-version = "1.81"
 description = "Task Orchestration Framework"
 license = "MIT"
 documentation = "https://docs.rs/choir"

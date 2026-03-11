@@ -10,7 +10,7 @@ Lifetime of a Task:
   3. Scheduled: no more dependencies can be added to the task.
   4. Executing: task was dispatched from the queue by one of the workers.
   5. Done: task is retired.
-!*/
+*/
 
 #![allow(
     renamed_and_removed_lints,
@@ -21,7 +21,8 @@ Lifetime of a Task:
     clippy::if_same_then_else,
     clippy::unknown_clippy_lints,
     clippy::len_without_is_empty,
-    clippy::should_implement_trait
+    clippy::should_implement_trait,
+    clippy::missing_transmute_annotations
 )]
 #![warn(
     missing_docs,
