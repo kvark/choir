@@ -452,10 +452,23 @@ impl Choir {
         self.unregister(index);
     }
 
+    fn flush_notifier(notifier: &Notifier) {
+        let mut guard = notifier.continuation.lock().unwrap();
+        if let Some(mut cont) = guard.take() {
+            cont.unpark_waiting();
+            for dependent in cont.dependents {
+                if let Some(ready) = Linearc::into_inner(dependent) {
+                    Self::flush_notifier(&ready.notifier);
+                }
+            }
+            for parent in cont.parents {
+                Self::flush_notifier(&parent);
+            }
+        }
+    }
+
     fn flush_queue(&self) {
         let mut num_tasks = 0;
-        // Collect notifiers whose dependents also need unblocking
-        let mut pending_notifiers: Vec<Arc<Notifier>> = Vec::new();
         loop {
             match self.injector.steal() {
                 Steal::Empty => {
@@ -463,23 +476,9 @@ impl Choir {
                 }
                 Steal::Success(task) => {
                     num_tasks += 1;
-                    pending_notifiers.push(task.notifier);
+                    Self::flush_notifier(&task.notifier);
                 }
                 Steal::Retry => {}
-            }
-        }
-        // Unblock all dependents transitively so that threads
-        // waiting on downstream tasks don't hang forever.
-        while let Some(notifier) = pending_notifiers.pop() {
-            let mut guard = notifier.continuation.lock().unwrap();
-            if let Some(mut cont) = guard.take() {
-                cont.unpark_waiting();
-                for dependent in cont.dependents {
-                    if let Some(ready) = Linearc::into_inner(dependent) {
-                        pending_notifiers.push(ready.notifier);
-                    }
-                }
-                pending_notifiers.extend(cont.parents);
             }
         }
         log::trace!("\tflushed {} tasks down the drain", num_tasks);
