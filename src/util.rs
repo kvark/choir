@@ -7,7 +7,10 @@ pub struct PerTaskData<T> {
     data: Box<[UnsafeCell<Option<T>>]>,
 }
 
-unsafe impl<T> Sync for PerTaskData<T> {}
+// SAFETY: Each element is accessed at most once (by one sub-task index),
+// so no true sharing occurs. `T: Send` is required because different
+// threads move values of type `T` out via `take`.
+unsafe impl<T: Send> Sync for PerTaskData<T> {}
 
 impl<T> PerTaskData<T> {
     /// Take an element at a given index.

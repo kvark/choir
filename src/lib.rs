@@ -51,7 +51,7 @@ use std::{
 };
 
 const BITS_PER_BYTE: usize = 8;
-const MAX_WORKERS: usize = mem::size_of::<usize>() * BITS_PER_BYTE;
+const MAX_WORKERS: usize = size_of::<usize>() * BITS_PER_BYTE;
 
 /// Name to be associated with a task.
 pub type Name = Cow<'static, str>;
@@ -126,7 +126,7 @@ impl<'a> ExecutionContext<'a> {
     /// This is useful because it allows creating tasks on the fly from within
     /// other tasks. Generally, making a task in flight depend on anything is impossible.
     /// But one can fork a dependency instead.
-    pub fn fork<N: Into<Name>>(&self, name: N) -> ProtoTask {
+    pub fn fork<N: Into<Name>>(&self, name: N) -> ProtoTask<'_> {
         let name = name.into();
         log::trace!("Forking task {} as '{}'", self.notifier, name);
         ProtoTask {
@@ -224,11 +224,9 @@ pub struct MaybePanic {
 }
 impl Drop for MaybePanic {
     fn drop(&mut self) {
-        assert_eq!(
-            self.worker_index, -1,
-            "Panic occurred on worker {}",
-            self.worker_index,
-        );
+        if self.worker_index != -1 && !thread::panicking() {
+            panic!("Panic occurred on worker {}", self.worker_index);
+        }
     }
 }
 
@@ -333,7 +331,7 @@ impl Choir {
                     worker_index,
                 );
                 debug_assert!(sub_range.start < sub_range.end);
-                let middle = (sub_range.end + sub_range.start) >> 1;
+                let middle = sub_range.start + (sub_range.end - sub_range.start) / 2;
                 // split the task if needed
                 if middle != sub_range.start && *self.parked_mask_mutex.lock().unwrap() != 0 {
                     self.injector.push(Task {
@@ -456,6 +454,8 @@ impl Choir {
 
     fn flush_queue(&self) {
         let mut num_tasks = 0;
+        // Collect notifiers whose dependents also need unblocking
+        let mut pending_notifiers: Vec<Arc<Notifier>> = Vec::new();
         loop {
             match self.injector.steal() {
                 Steal::Empty => {
@@ -463,12 +463,23 @@ impl Choir {
                 }
                 Steal::Success(task) => {
                     num_tasks += 1;
-                    let mut guard = task.notifier.continuation.lock().unwrap();
-                    if let Some(mut cont) = guard.take() {
-                        cont.unpark_waiting();
-                    }
+                    pending_notifiers.push(task.notifier);
                 }
                 Steal::Retry => {}
+            }
+        }
+        // Unblock all dependents transitively so that threads
+        // waiting on downstream tasks don't hang forever.
+        while let Some(notifier) = pending_notifiers.pop() {
+            let mut guard = notifier.continuation.lock().unwrap();
+            if let Some(mut cont) = guard.take() {
+                cont.unpark_waiting();
+                for dependent in cont.dependents {
+                    if let Some(ready) = Linearc::into_inner(dependent) {
+                        pending_notifiers.push(ready.notifier);
+                    }
+                }
+                pending_notifiers.extend(cont.parents);
             }
         }
         log::trace!("\tflushed {} tasks down the drain", num_tasks);
@@ -706,7 +717,7 @@ impl RunningTask {
             let condvar = Condvar::new();
             cont.waiting_threads
                 .push(WaitingThread { condvar: &condvar });
-            let _ = condvar.wait_while(guard, |cont| cont.is_some());
+            let _guard = condvar.wait_while(guard, |cont| cont.is_some());
         }
         self.choir.check_panic()
     }
