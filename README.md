@@ -45,7 +45,17 @@ Note that all tasks are pre-empted at the `Fn()` execution boundary. Thus, for e
 
 ### TODO:
   - detect when dependencies aren't set up correctly
-  - test with [Loom](https://github.com/tokio-rs/loom): blocked by https://github.com/crossbeam-rs/crossbeam/pull/849
+
+### Testing with [Loom](https://github.com/tokio-rs/loom)
+
+Loom tests use a `Mutex<VecDeque>` queue in place of `crossbeam-deque::Injector`
+(loom support in crossbeam-deque is still pending: https://github.com/crossbeam-rs/crossbeam/pull/849).
+This lets loom verify all the other synchronization logic (`Linearc` atomics,
+`Condvar`/`Mutex` interactions, dependency resolution).
+
+```sh
+RUSTFLAGS='--cfg loom' cargo test --test loom --release
+```
 
 ## Overhead
 
