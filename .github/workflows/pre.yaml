@@ -35,6 +35,14 @@ jobs:
           components: miri
       - name: Miri test
         run: cargo miri test --workspace
+  loom:
+    name: Loom
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Loom test
+        run: RUSTFLAGS='--cfg loom' cargo test --test loom --release
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
