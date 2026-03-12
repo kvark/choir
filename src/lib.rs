@@ -36,20 +36,21 @@ Lifetime of a Task:
 
 /// Better shared pointer.
 pub mod arc;
+pub(crate) mod compat;
+pub(crate) mod queue;
 /// Additional utilities.
 pub mod util;
 
 use self::arc::Linearc;
-use crossbeam_deque::{Injector, Steal};
-use std::{
-    borrow::Cow,
-    fmt, mem, ops,
-    sync::{
-        atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering},
-        Arc, Condvar, Mutex, RwLock,
-    },
-    thread, time,
+use crate::compat::{
+    wait_while, Arc, AtomicBool, AtomicUsize, Condvar, Mutex, Ordering, RwLock,
 };
+use crate::queue::{Injector, Steal};
+use std::{borrow::Cow, fmt, mem, ops, sync::atomic::AtomicIsize, time};
+#[cfg(not(loom))]
+use std::thread;
+#[cfg(loom)]
+use loom::thread;
 
 const BITS_PER_BYTE: usize = 8;
 const MAX_WORKERS: usize = size_of::<usize>() * BITS_PER_BYTE;
@@ -159,7 +160,8 @@ impl<'a> ExecutionContext<'a> {
 
 impl Drop for ExecutionContext<'_> {
     fn drop(&mut self) {
-        if thread::panicking() {
+        #[allow(unused_qualifications)] // loom::thread lacks panicking()
+        if std::thread::panicking() {
             self.choir.issue_panic(self.worker_index);
             let mut guard = self.notifier.continuation.lock().unwrap();
             if let Some(mut cont) = guard.take() {
@@ -225,7 +227,8 @@ pub struct MaybePanic {
 }
 impl Drop for MaybePanic {
     fn drop(&mut self) {
-        if self.worker_index != -1 && !thread::panicking() {
+        #[allow(unused_qualifications)] // loom::thread lacks panicking()
+        if self.worker_index != -1 && !std::thread::panicking() {
             panic!("Panic occurred on worker {}", self.worker_index);
         }
     }
@@ -246,7 +249,7 @@ impl Default for Choir {
         let injector = Injector::new();
         Self {
             injector,
-            condvar: Condvar::default(),
+            condvar: Condvar::new(),
             parked_mask_mutex: Mutex::new(0),
             workers: RwLock::new(WorkerPool {
                 contexts: [NO_WORKER; MAX_WORKERS],
@@ -254,6 +257,19 @@ impl Default for Choir {
             panic_worker: AtomicIsize::new(-1),
         }
     }
+}
+
+#[cfg(not(loom))]
+fn spawn_worker(name: &str, f: impl FnOnce() + Send + 'static) -> thread::JoinHandle<()> {
+    thread::Builder::new()
+        .name(name.to_string())
+        .spawn(f)
+        .unwrap()
+}
+
+#[cfg(loom)]
+fn spawn_worker(_name: &str, f: impl FnOnce() + Send + 'static) -> thread::JoinHandle<()> {
+    thread::spawn(f)
 }
 
 impl Choir {
@@ -274,10 +290,7 @@ impl Choir {
         let worker_clone = Arc::clone(&worker);
         let choir = Arc::clone(self);
 
-        let join_handle = thread::Builder::new()
-            .name(name.to_string())
-            .spawn(move || choir.work_loop(&worker_clone))
-            .unwrap();
+        let join_handle = spawn_worker(name, move || choir.work_loop(&worker_clone));
 
         WorkerHandle {
             worker,
@@ -301,6 +314,10 @@ impl Choir {
     fn schedule(&self, task: Task) {
         log::trace!("Task {} is scheduled", task.notifier);
         self.injector.push(task);
+        // Lock the parked-mask mutex so that a worker that is between
+        // checking `is_empty()` and entering `condvar.wait()` is guaranteed
+        // to receive this notification (same pattern as WorkerHandle::drop).
+        let _guard = self.parked_mask_mutex.lock().unwrap();
         self.condvar.notify_one();
     }
 
@@ -434,12 +451,9 @@ impl Choir {
                     // we handle a race condition between something pushing a task,
                     // and the thread going on the way to sleep.
                     *parked_mask |= mask;
-                    parked_mask = self
-                        .condvar
-                        .wait_while(parked_mask, |_| {
-                            worker.alive.load(Ordering::Acquire) && self.injector.is_empty()
-                        })
-                        .unwrap();
+                    parked_mask = wait_while(&self.condvar, parked_mask, |_| {
+                        worker.alive.load(Ordering::Acquire) && self.injector.is_empty()
+                    });
                     *parked_mask &= !mask;
                 }
                 Steal::Success(task) => {
@@ -717,7 +731,7 @@ impl RunningTask {
             let condvar = Condvar::new();
             cont.waiting_threads
                 .push(WaitingThread { condvar: &condvar });
-            let _guard = condvar.wait_while(guard, |cont| cont.is_some());
+            let _guard = wait_while(&condvar, guard, |cont| cont.is_some());
         }
         self.choir.check_panic()
     }
@@ -768,6 +782,7 @@ impl RunningTask {
 
     /// Block until the task has finished executing, with timeout.
     /// Panics and prints helpful info if the timeout is reached.
+    #[cfg(not(loom))]
     pub fn join_debug(&self, timeout: time::Duration) -> MaybePanic {
         log::debug!("Joining {}", self.notifier);
         let mut guard = self.notifier.continuation.lock().unwrap();
@@ -785,6 +800,12 @@ impl RunningTask {
             }
         }
         self.choir.check_panic()
+    }
+
+    /// Under loom, timeouts are not meaningful — falls back to `join()`.
+    #[cfg(loom)]
+    pub fn join_debug(&self, _timeout: time::Duration) -> MaybePanic {
+        self.join()
     }
 }
 

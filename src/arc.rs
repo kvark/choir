@@ -1,8 +1,5 @@
-use std::{
-    fmt, mem, ops,
-    ptr::NonNull,
-    sync::atomic::{AtomicUsize, Ordering},
-};
+use crate::compat::{AtomicUsize, Ordering};
+use std::{fmt, mem, ops, ptr::NonNull};
 
 /// Note: `pub(super)` is only needed for a hack
 #[derive(Debug)]
