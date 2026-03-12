@@ -42,15 +42,13 @@ pub(crate) mod queue;
 pub mod util;
 
 use self::arc::Linearc;
-use crate::compat::{
-    wait_while, Arc, AtomicBool, AtomicUsize, Condvar, Mutex, Ordering, RwLock,
-};
+use crate::compat::{wait_while, Arc, AtomicBool, AtomicUsize, Condvar, Mutex, Ordering, RwLock};
 use crate::queue::{Injector, Steal};
-use std::{borrow::Cow, fmt, mem, ops, sync::atomic::AtomicIsize, time};
-#[cfg(not(loom))]
-use std::thread;
 #[cfg(loom)]
 use loom::thread;
+#[cfg(not(loom))]
+use std::thread;
+use std::{borrow::Cow, fmt, mem, ops, sync::atomic::AtomicIsize, time};
 
 const BITS_PER_BYTE: usize = 8;
 const MAX_WORKERS: usize = size_of::<usize>() * BITS_PER_BYTE;
