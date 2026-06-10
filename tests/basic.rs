@@ -242,24 +242,14 @@ fn task_panic() {
 }
 
 /// Regression test: when a task panics, `flush_queue` must transitively
-/// notify dependents of any drained tasks. Without this, threads waiting
-/// on downstream tasks hang forever.
-///
-/// Setup (1 worker):
-///   - Task "panicker" occupies the worker, then panics.
-///   - While the worker is busy, task B is queued, and task C depends on B.
-///   - The main test thread joins on C via a helper thread.
-///
-/// On the old code, `flush_queue` drained B but only called `unpark_waiting`
-/// on B's notifier — it never walked B's dependents, so C was never unparked,
-/// and `join()` on C would hang forever.
+/// The worker survives the panic via catch_unwind, picks up B, and B's
+/// completion unblocks C normally.
 #[test]
-fn panic_flushes_dependents() {
+fn panic_worker_continues() {
     let _ = env_logger::try_init();
     let choir = choir::Choir::new();
     let _w = choir.add_worker("W");
 
-    // Occupy the only worker, then panic.
     let _panicker = choir
         .spawn("panicker")
         .init(|_| {
@@ -268,23 +258,19 @@ fn panic_flushes_dependents() {
         })
         .run();
 
-    // B is queued (worker is busy). C depends on B.
     let b = choir.spawn("B").init(|_| {}).run();
     let mut c = choir.spawn("C").init_dummy();
     c.depend_on(&b);
     let c_running = c.run();
 
-    // Join C on a helper thread so we can apply a timeout.
     let (tx, rx) = std::sync::mpsc::channel();
     let handle = thread::spawn(move || {
         let mp = c_running.join();
         let _ = tx.send(());
-        // Forget MaybePanic to avoid re-panicking this thread.
-        std::mem::forget(mp);
+        mp.dismiss();
     });
 
-    // If flush_queue doesn't walk dependents, this hangs forever.
     rx.recv_timeout(Duration::from_secs(5))
-        .expect("join on C must not hang after panic flushes the queue");
+        .expect("join on C must not hang after panic");
     handle.join().unwrap();
 }

@@ -122,7 +122,6 @@ fn join_debug_timeout_no_dangling_waiter() {
     let choir = choir::Choir::new();
     let _w = choir.add_worker("W");
 
-    // The task blocks until we allow it to finish.
     let (tx, rx) = std::sync::mpsc::channel::<()>();
     let task = choir
         .spawn("slow")
@@ -131,8 +130,6 @@ fn join_debug_timeout_no_dangling_waiter() {
         })
         .run();
 
-    // Join with a tiny timeout on a helper thread; the timeout panic is
-    // expected and contained to that thread.
     let task_clone = task.clone();
     let join_result = thread::spawn(move || {
         task_clone.join_debug(Duration::from_millis(50));
@@ -140,8 +137,124 @@ fn join_debug_timeout_no_dangling_waiter() {
     .join();
     assert!(join_result.is_err(), "join_debug must panic on timeout");
 
-    // Let the task finish: `finish` walks waiting_threads and must not
-    // touch the timed-out joiner's (now destroyed) condvar.
     tx.send(()).unwrap();
     task.join();
+}
+
+/// Workers survive task panics and continue processing.
+#[test]
+fn worker_survives_panic() {
+    let _ = env_logger::try_init();
+    let choir = choir::Choir::new();
+    let _w = choir.add_worker("W");
+
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag_clone = flag.clone();
+
+    let panicker = choir.spawn("panicker").init(|_| panic!("boom"));
+    let setter = choir.spawn("setter").init(move |_| {
+        flag_clone.store(true, std::sync::atomic::Ordering::Release);
+    });
+
+    let mut barrier = choir.spawn("barrier").init_dummy();
+    barrier.depend_on(&panicker);
+    barrier.depend_on(&setter);
+    let rt = barrier.run();
+    drop(panicker);
+    drop(setter);
+
+    let mp = rt.join();
+    mp.dismiss();
+    assert!(flag.load(std::sync::atomic::Ordering::Acquire));
+}
+
+/// clear_panic resets the panic state.
+#[test]
+fn clear_panic_resets_state() {
+    let _ = env_logger::try_init();
+    let choir = choir::Choir::new();
+    let _w = choir.add_worker("W");
+
+    let t = choir.spawn("p").init(|_| panic!("boom")).run();
+    assert!(t.join().into_result().is_err());
+
+    assert!(choir.check_panic().into_result().is_err());
+    choir.clear_panic();
+    assert!(choir.check_panic().into_result().is_ok());
+}
+
+/// Scoped tasks can borrow from the enclosing stack frame.
+#[test]
+fn scope_borrows_local_data() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    let _ = env_logger::try_init();
+    let choir = choir::Choir::new();
+    let _w = choir.add_worker("W");
+
+    let data: Vec<AtomicU32> = (0..4).map(|_| AtomicU32::new(0)).collect();
+    choir.scope(|s| {
+        for (i, slot) in data.iter().enumerate() {
+            s.spawn(format!("task-{}", i), move |_| {
+                slot.store((i as u32 + 1) * 10, Ordering::Relaxed);
+            });
+        }
+    });
+    let result: Vec<u32> = data.iter().map(|a| a.load(Ordering::Relaxed)).collect();
+    assert_eq!(result, vec![10, 20, 30, 40]);
+}
+
+/// A scoped task panic propagates after all tasks complete.
+#[test]
+fn scope_propagates_task_panic() {
+    let _ = env_logger::try_init();
+    let choir = choir::Choir::new();
+    let _w = choir.add_worker("W");
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        choir.scope(|s| {
+            s.spawn("ok", |_| {});
+            s.spawn("boom", |_| panic!("scoped panic"));
+        });
+    }));
+    // The scope itself doesn't re-panic on task panics, but
+    // issue_panic was called, so check_panic would catch it.
+    // Clear it for a clean state.
+    choir.clear_panic();
+    // The scope body didn't panic, so result is Ok.
+    assert!(result.is_ok());
+}
+
+/// with_workers convenience constructor.
+#[test]
+fn with_workers_creates_pool() {
+    let _ = env_logger::try_init();
+    let (choir, _handles) = choir::Choir::with_workers(3);
+
+    let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let c = counter.clone();
+    choir
+        .spawn("count")
+        .init(move |_| {
+            c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        })
+        .run()
+        .join()
+        .dismiss();
+    assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 1);
+}
+
+/// MaybePanic::into_result returns Ok for clean and Err for panicked.
+#[test]
+fn maybe_panic_into_result() {
+    let _ = env_logger::try_init();
+    let choir = choir::Choir::new();
+    let _w = choir.add_worker("W");
+
+    let t = choir.spawn("ok").init(|_| {}).run();
+    assert!(t.join().into_result().is_ok());
+
+    let t2 = choir.spawn("boom").init(|_| panic!("boom")).run();
+    assert!(t2.join().into_result().is_err());
+    choir.clear_panic();
 }

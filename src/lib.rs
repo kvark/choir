@@ -229,6 +229,25 @@ impl Drop for UnregisterGuard<'_> {
 pub struct MaybePanic {
     worker_index: isize,
 }
+
+impl MaybePanic {
+    /// Dismiss this panic guard without panicking.
+    pub fn dismiss(self) {
+        mem::forget(self);
+    }
+
+    /// Convert into a `Result`, consuming the guard without panicking.
+    pub fn into_result(self) -> Result<(), isize> {
+        let wi = self.worker_index;
+        mem::forget(self);
+        if wi == -1 {
+            Ok(())
+        } else {
+            Err(wi)
+        }
+    }
+}
+
 impl Drop for MaybePanic {
     fn drop(&mut self) {
         #[allow(unused_qualifications)] // loom::thread lacks panicking()
@@ -282,25 +301,42 @@ impl Choir {
         Arc::new(Self::default())
     }
 
-    /// Add a new worker thread.
+    /// Try to add a new worker thread.
     ///
-    /// Note: A system can't have more than `MAX_WORKERS` workers
-    /// enabled at any time.
-    pub fn add_worker(self: &Arc<Self>, name: &str) -> WorkerHandle {
+    /// Returns `None` if the worker pool is full (more than `MAX_WORKERS`).
+    /// The worker slot is registered on the calling thread, so a full
+    /// pool is detected immediately without spawning a thread.
+    pub fn try_add_worker(self: &Arc<Self>, name: &str) -> Option<WorkerHandle> {
+        let index = self.register()?;
         let worker = Arc::new(Worker {
             name: name.to_string(),
             alive: AtomicBool::new(true),
         });
         let worker_clone = Arc::clone(&worker);
         let choir = Arc::clone(self);
-
-        let join_handle = spawn_worker(name, move || choir.work_loop(&worker_clone));
-
-        WorkerHandle {
+        let join_handle = spawn_worker(name, move || choir.work_loop(&worker_clone, index));
+        Some(WorkerHandle {
             worker,
             join_handle: Some(join_handle),
             choir: Arc::clone(self),
-        }
+        })
+    }
+
+    /// Add a new worker thread.
+    ///
+    /// Panics if the worker pool is full (more than `MAX_WORKERS`).
+    pub fn add_worker(self: &Arc<Self>, name: &str) -> WorkerHandle {
+        self.try_add_worker(name)
+            .unwrap_or_else(|| panic!("worker pool is full (max {} workers)", MAX_WORKERS))
+    }
+
+    /// Create a new task system with `n` worker threads.
+    pub fn with_workers(n: usize) -> (Arc<Self>, Vec<WorkerHandle>) {
+        let choir = Self::new();
+        let handles = (0..n)
+            .map(|i| choir.add_worker(&format!("worker-{}", i)))
+            .collect();
+        (choir, handles)
     }
 
     /// Spawn a new task.
@@ -446,9 +482,8 @@ impl Choir {
         self.condvar.notify_one();
     }
 
-    fn work_loop(self: &Arc<Self>, worker: &Worker) {
+    fn work_loop(self: &Arc<Self>, worker: &Worker, index: usize) {
         profiling::register_thread!();
-        let index = self.register().unwrap();
         let _unreg = UnregisterGuard { choir: self, index };
         log::info!("Thread[{}] = '{}' started", index, worker.name);
 
@@ -458,9 +493,6 @@ impl Choir {
                     log::trace!("Thread[{}] sleeps", index);
                     let mask = 1 << index;
                     let mut parked_mask = self.parked_mask_mutex.lock().unwrap();
-                    // Note: the check for `injector.is_empty()` here ensures that
-                    // we handle a race condition between something pushing a task,
-                    // and the thread going on the way to sleep.
                     *parked_mask |= mask;
                     parked_mask = wait_while(&self.condvar, parked_mask, |_| {
                         worker.alive.load(Ordering::Acquire) && self.injector.is_empty()
@@ -468,7 +500,9 @@ impl Choir {
                     *parked_mask &= !mask;
                 }
                 Steal::Success(task) => {
-                    self.execute(task, index as isize);
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        self.execute(task, index as isize);
+                    }));
                 }
                 Steal::Retry => {}
             }
@@ -529,21 +563,24 @@ impl Choir {
 
     fn issue_panic(&self, worker_index: isize) {
         log::debug!("panic on worker {}", worker_index);
-        // Only record the first panic: a later one (or an inline `-1`
-        // execution) must not clobber the original worker index.
         let _ = self.panic_worker.compare_exchange(
             -1,
             worker_index,
             Ordering::AcqRel,
             Ordering::Acquire,
         );
-        self.flush_queue();
     }
 
     /// Check if any of the workers terminated with panic.
     pub fn check_panic(&self) -> MaybePanic {
         let worker_index = self.panic_worker.load(Ordering::Acquire);
         MaybePanic { worker_index }
+    }
+
+    /// Clear any previously recorded panic, so that future
+    /// `check_panic` calls return a clean `MaybePanic`.
+    pub fn clear_panic(&self) {
+        self.panic_worker.store(-1, Ordering::Release);
     }
 }
 
@@ -859,13 +896,19 @@ impl Drop for WorkerHandle {
     fn drop(&mut self) {
         self.worker.alive.store(false, Ordering::Release);
         let handle = self.join_handle.take().unwrap();
-        // make sure it wakes up and checks if it's still alive
-        // Locking the mutex is required to guarantee that the worker loop
-        // actually receives the notification.
         if let Ok(_guard) = self.choir.parked_mask_mutex.lock() {
             self.choir.condvar.notify_all();
         }
         let _ = handle.join();
+        // If all workers are gone and tasks remain queued,
+        // flush them so joiners are unblocked.
+        if !self.choir.injector.is_empty() {
+            let pool = self.choir.workers.read().unwrap();
+            if pool.contexts.iter().all(|c| c.is_none()) {
+                drop(pool);
+                self.choir.flush_queue();
+            }
+        }
     }
 }
 
@@ -913,6 +956,111 @@ impl Drop for IdleTask {
     fn drop(&mut self) {
         if let Some(ready) = self.task.extract() {
             self.choir.schedule(ready);
+        }
+    }
+}
+
+/// A scope for spawning non-`'static` tasks that borrow from the enclosing frame.
+///
+/// All tasks spawned through a `Scope` are guaranteed to complete before
+/// [`Choir::scope`] returns, so closures may safely borrow local data.
+pub struct Scope<'scope> {
+    choir: &'scope Arc<Choir>,
+    fence: Arc<Notifier>,
+    _marker: std::marker::PhantomData<&'scope mut &'scope ()>,
+}
+
+impl<'scope> Scope<'scope> {
+    /// Spawn a scoped task that may borrow from the enclosing scope.
+    pub fn spawn<N: Into<Name>>(&self, name: N, f: impl FnOnce(ExecutionContext) + Send + 'scope) {
+        self.fence
+            .continuation
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .forks += 1;
+
+        // Wrap in catch_unwind so the task completes normally from the
+        // framework's perspective, ensuring proper fork-counter accounting.
+        // Without this, ExecutionContext::drop would call flush_notifier,
+        // potentially unblocking the scope before all tasks finish.
+        let wrapper = move |ec: ExecutionContext| {
+            let worker_index = ec.worker_index;
+            let choir = Arc::clone(ec.choir);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(ec)));
+            if result.is_err() {
+                choir.issue_panic(worker_index);
+            }
+        };
+
+        // SAFETY: the scope blocks until all tasks complete, so
+        // borrows from 'scope outlive every task.
+        let wrapper: Box<dyn FnOnce(ExecutionContext) + Send + 'scope> = Box::new(wrapper);
+        let wrapper: Box<dyn FnOnce(ExecutionContext) + Send + 'static> =
+            unsafe { mem::transmute(wrapper) };
+
+        let task = Task {
+            functor: Functor::Once(wrapper),
+            notifier: Arc::new(Notifier {
+                name: name.into(),
+                continuation: Mutex::new(Some(Continuation {
+                    parents: vec![Arc::clone(&self.fence)],
+                    forks: 0,
+                    dependents: Vec::new(),
+                    waiting_threads: Vec::new(),
+                })),
+            }),
+        };
+        self.choir.schedule(task);
+    }
+}
+
+impl Choir {
+    /// Execute a closure that can spawn non-`'static` tasks.
+    ///
+    /// All tasks spawned via the [`Scope`] are guaranteed to complete
+    /// before this method returns, so closures may borrow from the
+    /// enclosing stack frame.
+    ///
+    /// If any spawned task panics, the scope waits for all remaining
+    /// tasks to complete before propagating the panic.
+    pub fn scope<'scope, R>(self: &'scope Arc<Self>, f: impl FnOnce(&Scope<'scope>) -> R) -> R {
+        let fence = Arc::new(Notifier {
+            name: "scope-fence".into(),
+            continuation: Mutex::new(Some(Continuation {
+                parents: Vec::new(),
+                forks: 0,
+                dependents: Vec::new(),
+                waiting_threads: Vec::new(),
+            })),
+        });
+
+        let scope = Scope {
+            choir: self,
+            fence: Arc::clone(&fence),
+            _marker: std::marker::PhantomData,
+        };
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&scope)));
+
+        // Body complete — count as one finish (same as a parent task body).
+        let mut notifiers = self.finish(&fence);
+        while let Some(n) = notifiers.pop() {
+            notifiers.extend(self.finish(&n));
+        }
+
+        // Wait for any remaining spawned tasks.
+        let mp = RunningTask {
+            choir: Arc::clone(self),
+            notifier: fence,
+        }
+        .join_active();
+        mp.dismiss();
+
+        match result {
+            Ok(r) => r,
+            Err(payload) => std::panic::resume_unwind(payload),
         }
     }
 }
