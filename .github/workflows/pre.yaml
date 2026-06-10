@@ -11,10 +11,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.81.0"
+      # Note: only the library is checked. Dev-dependencies (criterion and
+      # its transitive deps like clap) are not bound by the MSRV — they are
+      # never built by library consumers.
       - name: Main check
         run: cargo check --workspace
-      - name: Bench compile check
-        run: cargo bench --no-run
   test:
     name: Test Nightly
     runs-on: ubuntu-latest
@@ -25,6 +26,8 @@ jobs:
         run: cargo test
       - name: Test all
         run: cargo test --workspace
+      - name: Bench compile check
+        run: cargo bench --no-run
   miri:
     name: Miri
     runs-on: ubuntu-latest

@@ -161,10 +161,7 @@ impl Drop for ExecutionContext<'_> {
         #[allow(unused_qualifications)] // loom::thread lacks panicking()
         if std::thread::panicking() {
             self.choir.issue_panic(self.worker_index);
-            let mut guard = self.notifier.continuation.lock().unwrap();
-            if let Some(mut cont) = guard.take() {
-                cont.unpark_waiting();
-            }
+            Choir::flush_notifier(self.notifier);
         }
     }
 }
@@ -215,6 +212,16 @@ struct WorkerContext {}
 
 struct WorkerPool {
     contexts: [Option<WorkerContext>; MAX_WORKERS],
+}
+
+struct UnregisterGuard<'a> {
+    choir: &'a Choir,
+    index: usize,
+}
+impl Drop for UnregisterGuard<'_> {
+    fn drop(&mut self) {
+        self.choir.unregister(self.index);
+    }
 }
 
 /// Return type for `join` functions that have to detect panics.
@@ -401,6 +408,8 @@ impl Choir {
                     cont.forks -= 1;
                     return Vec::new();
                 }
+            } else {
+                return Vec::new();
             }
             let mut cont = guard.take().unwrap();
             //Note: this is important to do within the lock,
@@ -437,6 +446,7 @@ impl Choir {
     fn work_loop(self: &Arc<Self>, worker: &Worker) {
         profiling::register_thread!();
         let index = self.register().unwrap();
+        let _unreg = UnregisterGuard { choir: self, index };
         log::info!("Thread[{}] = '{}' started", index, worker.name);
 
         while worker.alive.load(Ordering::Acquire) {
@@ -462,20 +472,34 @@ impl Choir {
         }
 
         log::info!("Thread '{}' dies", worker.name);
-        self.unregister(index);
     }
 
     fn flush_notifier(notifier: &Notifier) {
+        let mut worklist: Vec<Arc<Notifier>> = Vec::new();
+
         let mut guard = notifier.continuation.lock().unwrap();
         if let Some(mut cont) = guard.take() {
+            drop(guard);
             cont.unpark_waiting();
-            for dependent in cont.dependents {
-                if let Some(ready) = Linearc::into_inner(dependent) {
-                    Self::flush_notifier(&ready.notifier);
+            for dep in cont.dependents {
+                if let Some(task) = Linearc::into_inner(dep) {
+                    worklist.push(task.notifier);
                 }
             }
-            for parent in cont.parents {
-                Self::flush_notifier(&parent);
+            worklist.extend(cont.parents);
+        }
+
+        while let Some(n) = worklist.pop() {
+            let mut guard = n.continuation.lock().unwrap();
+            if let Some(mut cont) = guard.take() {
+                drop(guard);
+                cont.unpark_waiting();
+                for dep in cont.dependents {
+                    if let Some(task) = Linearc::into_inner(dep) {
+                        worklist.push(task.notifier);
+                    }
+                }
+                worklist.extend(cont.parents);
             }
         }
     }
@@ -738,6 +762,15 @@ impl RunningTask {
     /// Also, use the current thread to help in the meantime.
     #[profiling::function]
     pub fn join_active(&self) -> MaybePanic {
+        let Some(index) = self.choir.register() else {
+            return self.join();
+        };
+        let _unreg = UnregisterGuard {
+            choir: &self.choir,
+            index,
+        };
+        log::info!("Join thread[{}] started", index);
+
         let condvar;
         match *self.notifier.continuation.lock().unwrap() {
             Some(ref mut cont) => {
@@ -747,8 +780,6 @@ impl RunningTask {
             }
             None => return self.choir.check_panic(),
         }
-        let index = self.choir.register().unwrap();
-        log::info!("Join thread[{}] started", index);
 
         loop {
             let is_done = match self.choir.injector.steal() {
@@ -759,7 +790,7 @@ impl RunningTask {
                         let guard = condvar.wait(guard).unwrap();
                         guard.is_none()
                     } else {
-                        false
+                        true
                     }
                 }
                 Steal::Success(task) => {
@@ -774,7 +805,6 @@ impl RunningTask {
         }
 
         log::info!("Thread[{}] is released", index);
-        self.choir.unregister(index);
         self.choir.check_panic()
     }
 

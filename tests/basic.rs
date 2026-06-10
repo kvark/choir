@@ -276,7 +276,7 @@ fn panic_flushes_dependents() {
 
     // Join C on a helper thread so we can apply a timeout.
     let (tx, rx) = std::sync::mpsc::channel();
-    thread::spawn(move || {
+    let handle = thread::spawn(move || {
         let mp = c_running.join();
         let _ = tx.send(());
         // Forget MaybePanic to avoid re-panicking this thread.
@@ -286,4 +286,5 @@ fn panic_flushes_dependents() {
     // If flush_queue doesn't walk dependents, this hangs forever.
     rx.recv_timeout(Duration::from_secs(5))
         .expect("join on C must not hang after panic flushes the queue");
+    handle.join().unwrap();
 }
