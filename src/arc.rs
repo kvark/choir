@@ -75,9 +75,14 @@ impl<T> Linearc<T> {
 
 impl<T: ?Sized> Clone for Linearc<T> {
     fn clone(&self) -> Self {
-        unsafe { self.ptr.as_ref() }
+        let old = unsafe { self.ptr.as_ref() }
             .ref_count
             .fetch_add(1, Ordering::Relaxed);
+        // Same guard as `std::sync::Arc`: a wrapped refcount would lead
+        // to a double-free, so abort if it gets implausibly large.
+        if old > isize::MAX as usize {
+            std::process::abort();
+        }
         Self { ptr: self.ptr }
     }
 }

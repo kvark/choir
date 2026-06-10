@@ -21,8 +21,7 @@ Lifetime of a Task:
     clippy::if_same_then_else,
     clippy::unknown_clippy_lints,
     clippy::len_without_is_empty,
-    clippy::should_implement_trait,
-    clippy::missing_transmute_annotations
+    clippy::should_implement_trait
 )]
 #![warn(
     missing_docs,
@@ -363,6 +362,10 @@ impl Choir {
                     });
                     log::trace!("\tsplit out {:?}", middle..sub_range.end);
                     sub_range.end = middle;
+                    // Hold the lock while notifying, so a worker between its
+                    // empty-check and `wait()` can't miss this wakeup
+                    // (same pattern as `schedule`).
+                    let _guard = self.parked_mask_mutex.lock().unwrap();
                     self.condvar.notify_one();
                 }
                 // fun the functor
@@ -479,8 +482,11 @@ impl Choir {
 
         let mut guard = notifier.continuation.lock().unwrap();
         if let Some(mut cont) = guard.take() {
-            drop(guard);
+            // Unpark while still holding the lock (same as `finish`): a joiner
+            // waking spuriously would otherwise observe `None`, return, and
+            // destroy the stack condvar we are about to notify.
             cont.unpark_waiting();
+            drop(guard);
             for dep in cont.dependents {
                 if let Some(task) = Linearc::into_inner(dep) {
                     worklist.push(task.notifier);
@@ -492,8 +498,8 @@ impl Choir {
         while let Some(n) = worklist.pop() {
             let mut guard = n.continuation.lock().unwrap();
             if let Some(mut cont) = guard.take() {
-                drop(guard);
                 cont.unpark_waiting();
+                drop(guard);
                 for dep in cont.dependents {
                     if let Some(task) = Linearc::into_inner(dep) {
                         worklist.push(task.notifier);
@@ -523,7 +529,14 @@ impl Choir {
 
     fn issue_panic(&self, worker_index: isize) {
         log::debug!("panic on worker {}", worker_index);
-        self.panic_worker.store(worker_index, Ordering::Release);
+        // Only record the first panic: a later one (or an inline `-1`
+        // execution) must not clobber the original worker index.
+        let _ = self.panic_worker.compare_exchange(
+            -1,
+            worker_index,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
         self.flush_queue();
     }
 
@@ -678,10 +691,7 @@ impl ProtoTask<'_> {
     /// The function body will be executed once the task is scheduled,
     /// and all of its dependencies are fulfilled.
     pub fn init<F: FnOnce(ExecutionContext) + Send + 'static>(self, fun: F) -> IdleTask {
-        let b: Box<dyn FnOnce(ExecutionContext) + Send + 'static> = Box::new(fun);
-        // Transmute is for the lifetime bound only: it's stored as `'static`,
-        // but the only way to run it is `run_attached`, which would be blocking.
-        self.fill(Functor::Once(unsafe { mem::transmute(b) }))
+        self.fill(Functor::Once(Box::new(fun)))
     }
 
     /// Init task to execute a function multiple times.
@@ -695,9 +705,7 @@ impl ProtoTask<'_> {
         self.fill(if count == 0 {
             Functor::Dummy
         } else {
-            let arc: Linearc<dyn Fn(ExecutionContext, SubIndex) + Send + Sync + 'static> =
-                Linearc::new_unsized(fun);
-            Functor::Multi(0..count, unsafe { mem::transmute(arc) })
+            Functor::Multi(0..count, Linearc::new_unsized(fun))
         })
     }
 
@@ -818,12 +826,22 @@ impl RunningTask {
             let condvar = Condvar::new();
             cont.waiting_threads
                 .push(WaitingThread { condvar: &condvar });
-            let (guard, wait_result) = condvar
+            let (mut guard, wait_result) = condvar
                 .wait_timeout_while(guard, timeout, |cont| cont.is_some())
                 .unwrap();
             if wait_result.timed_out() {
+                // The condvar lives on this stack frame, which is about to
+                // unwind. Remove our entry so that a later `finish` doesn't
+                // notify a dangling pointer.
+                if let Some(ref mut cont) = *guard {
+                    let condvar_ptr: *const Condvar = &condvar;
+                    cont.waiting_threads.retain(|wt| wt.condvar != condvar_ptr);
+                }
                 println!("Join timeout reached for {}", self.notifier);
                 println!("Continuation: {:?}", guard);
+                // Release before panicking: poisoning the continuation mutex
+                // would crash every other thread touching this notifier.
+                drop(guard);
                 panic!("");
             }
         }

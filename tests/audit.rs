@@ -112,3 +112,36 @@ fn linearc_send_sync_bounds() {
     assert!(was_last_here || was_last_there);
     assert!(!(was_last_here && was_last_there));
 }
+
+/// A timed-out `join_debug` must deregister its stack condvar before
+/// unwinding. If it doesn't, the task finishing later notifies a dangling
+/// pointer into the dead stack frame (use-after-free, caught by Miri).
+#[test]
+fn join_debug_timeout_no_dangling_waiter() {
+    let _ = env_logger::try_init();
+    let choir = choir::Choir::new();
+    let _w = choir.add_worker("W");
+
+    // The task blocks until we allow it to finish.
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let task = choir
+        .spawn("slow")
+        .init(move |_| {
+            let _ = rx.recv();
+        })
+        .run();
+
+    // Join with a tiny timeout on a helper thread; the timeout panic is
+    // expected and contained to that thread.
+    let task_clone = task.clone();
+    let join_result = thread::spawn(move || {
+        task_clone.join_debug(Duration::from_millis(50));
+    })
+    .join();
+    assert!(join_result.is_err(), "join_debug must panic on timeout");
+
+    // Let the task finish: `finish` walks waiting_threads and must not
+    // touch the timed-out joiner's (now destroyed) condvar.
+    tx.send(()).unwrap();
+    task.join();
+}
