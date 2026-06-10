@@ -19,8 +19,8 @@ pub struct Linearc<T: ?Sized> {
     ptr: NonNull<LinearcInner<T>>,
 }
 
-unsafe impl<T: ?Sized> Send for Linearc<T> {}
-unsafe impl<T: ?Sized> Sync for Linearc<T> {}
+unsafe impl<T: ?Sized + Send + Sync> Send for Linearc<T> {}
+unsafe impl<T: ?Sized + Send + Sync> Sync for Linearc<T> {}
 
 impl<T: ?Sized> Linearc<T> {
     #[inline]
@@ -77,7 +77,7 @@ impl<T: ?Sized> Clone for Linearc<T> {
     fn clone(&self) -> Self {
         unsafe { self.ptr.as_ref() }
             .ref_count
-            .fetch_add(1, Ordering::Release);
+            .fetch_add(1, Ordering::Relaxed);
         Self { ptr: self.ptr }
     }
 }
