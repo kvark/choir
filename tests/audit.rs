@@ -1,11 +1,4 @@
-use std::{
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    },
-    thread,
-    time::Duration,
-};
+use std::{thread, time::Duration};
 
 /// Finding A: when a task panics, its direct dependents must be unblocked.
 /// Previously, `ExecutionContext::drop` only called `unpark_waiting()` and
@@ -25,7 +18,7 @@ fn panic_unblocks_direct_dependents() {
 
     let (tx, rx) = std::sync::mpsc::channel();
     let b_clone = b_running.clone();
-    thread::spawn(move || {
+    let handle = thread::spawn(move || {
         let mp = b_clone.join();
         let _ = tx.send(());
         std::mem::forget(mp);
@@ -33,6 +26,7 @@ fn panic_unblocks_direct_dependents() {
 
     rx.recv_timeout(Duration::from_secs(5))
         .expect("B must not hang when A panics");
+    handle.join().unwrap();
 }
 
 /// Finding A extended: transitive dependents of a panicking task must also
@@ -54,7 +48,7 @@ fn panic_unblocks_transitive_dependents() {
 
     let (tx, rx) = std::sync::mpsc::channel();
     let c_clone = c_running.clone();
-    thread::spawn(move || {
+    let handle = thread::spawn(move || {
         let mp = c_clone.join();
         let _ = tx.send(());
         std::mem::forget(mp);
@@ -62,40 +56,39 @@ fn panic_unblocks_transitive_dependents() {
 
     rx.recv_timeout(Duration::from_secs(5))
         .expect("C must not hang when A panics transitively");
+    handle.join().unwrap();
 }
 
 /// Finding B: `finish()` must not crash if the continuation was already
 /// taken (e.g., by `flush_notifier` during panic handling).
-/// This test races a normal completion against a panic-triggered flush.
+/// Each iteration uses a fresh choir because panicking workers die.
 #[test]
 fn finish_tolerates_taken_continuation() {
     let _ = env_logger::try_init();
-    let choir = choir::Choir::new();
-    let _w1 = choir.add_worker("W1");
-    let _w2 = choir.add_worker("W2");
 
-    let completed = Arc::new(AtomicUsize::new(0));
+    let iterations = if cfg!(miri) { 2 } else { 10 };
+    for _ in 0..iterations {
+        let choir = choir::Choir::new();
+        let _w1 = choir.add_worker("W1");
+        let _w2 = choir.add_worker("W2");
 
-    for _ in 0..10 {
-        let c = completed.clone();
         let panicker = choir.spawn("panicker").init(|_| {
             panic!("boom");
         });
-        let mut follower = choir.spawn("follower").init(move |_| {
-            c.fetch_add(1, Ordering::Relaxed);
-        });
+        let mut follower = choir.spawn("follower").init(|_| {});
         follower.depend_on(&panicker);
         let r = follower.run();
         drop(panicker);
 
         let (tx, rx) = std::sync::mpsc::channel();
         let rc = r.clone();
-        thread::spawn(move || {
+        let handle = thread::spawn(move || {
             let mp = rc.join();
             let _ = tx.send(());
             std::mem::forget(mp);
         });
         let _ = rx.recv_timeout(Duration::from_secs(2));
+        handle.join().unwrap();
     }
 }
 
