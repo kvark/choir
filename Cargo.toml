@@ -22,6 +22,10 @@ members = [
 name = "ballpark"
 harness = false
 
+[[bench]]
+name = "refcount_gate"
+harness = false
+
 [dependencies]
 crossbeam-deque = "0.8"
 log = "0.4"
